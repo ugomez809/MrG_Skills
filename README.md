@@ -39,6 +39,28 @@ Merge into `~/.claude/settings.json` (merge — do not replace the whole file):
 Restart Claude Code. The plugin's skills and slash commands become available in
 every session, on every repo.
 
+### Local CLI / desktop vs. claude.ai/code (web)
+
+**Local Claude Code CLI / desktop (signed in):** the `settings.json` merge above
+is all you need — it fetches this marketplace from GitHub and enables it
+globally. Refresh a stale copy with `/plugin marketplace update mrg-skills`.
+
+**claude.ai/code (web):** cloud containers run with
+`SKIP_PLUGIN_MARKETPLACE=true` and do **not** fetch personal GitHub
+marketplaces at session start (the built-in plugins are pre-baked into the
+image). Editing `~/.claude/settings.json` on your own machine never reaches a
+web container. To make this plugin load in web sessions, add [`setup.sh`](./setup.sh)
+as the **Setup Script** in your claude.ai/code environment settings — it clones
+this repo into the container's plugin cache and enables it before the agent
+starts, on every web session and every repo. See
+https://code.claude.com/docs/en/claude-code-on-the-web for where to set the
+environment setup script.
+
+Alternatively, for a single repo, commit the skill as project files:
+`.claude/skills/ug-coding-loop/SKILL.md` and
+`.claude/commands/ug-coding-loop.md` — those load natively in any session
+(web or local) opened on that repo, no marketplace needed.
+
 > **Private repo note:** if `MrG_Skills` is private, fresh or remote containers
 > must have your GitHub auth configured to fetch the marketplace. On a machine
 > where `gh auth` / git credentials already work for this repo, nothing extra is
