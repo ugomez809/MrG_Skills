@@ -45,16 +45,20 @@ every session, on every repo.
 is all you need — it fetches this marketplace from GitHub and enables it
 globally. Refresh a stale copy with `/plugin marketplace update mrg-skills`.
 
-**claude.ai/code (web):** cloud containers run with
-`SKIP_PLUGIN_MARKETPLACE=true` and do **not** fetch personal GitHub
-marketplaces at session start (the built-in plugins are pre-baked into the
-image). Editing `~/.claude/settings.json` on your own machine never reaches a
-web container. To make this plugin load in web sessions, add [`setup.sh`](./setup.sh)
-as the **Setup Script** in your claude.ai/code environment settings — it clones
-this repo into the container's plugin cache and enables it before the agent
-starts, on every web session and every repo. See
-https://code.claude.com/docs/en/claude-code-on-the-web for where to set the
-environment setup script.
+**claude.ai/code (web):** cloud containers do **not** auto-fetch personal
+marketplaces per session. Instead the environment **Setup Script** installs
+plugins at container init with the `claude plugin` CLI. Add these two lines to
+that script (see [`setup.sh`](./setup.sh)):
+
+```bash
+claude plugin marketplace add ugomez809/MrG_Skills || true
+claude plugin install mrg-skills@mrg-skills || true
+```
+
+They sit alongside the same `claude plugin marketplace add` / `claude plugin
+install` lines that load caveman, superpowers, and codex. A new web session
+after saving loads `ug-coding-loop` and `/ug-coding-loop` on any repo. Setup
+Script location: https://code.claude.com/docs/en/claude-code-on-the-web
 
 Alternatively, for a single repo, commit the skill as project files:
 `.claude/skills/ug-coding-loop/SKILL.md` and
