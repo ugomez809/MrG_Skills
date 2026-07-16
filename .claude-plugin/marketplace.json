@@ -1,0 +1,11 @@
+{
+  "name": "mrg-skills",
+  "owner": { "name": "ugomez809" },
+  "plugins": [
+    {
+      "name": "mrg-skills",
+      "source": "./mrg-skills",
+      "description": "Ulises Gomez personal Claude Code skills"
+    }
+  ]
+}
