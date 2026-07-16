@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "mrg-skills",
-      "source": "./mrg-skills",
+      "source": "./",
       "description": "Ulises Gomez personal Claude Code skills"
     }
   ]

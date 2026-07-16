@@ -6,17 +6,24 @@ Add a skill = new folder + push. No settings changes after initial setup.
 
 ## Layout
 
+Repo root IS the plugin root (same mechanism as the caveman plugin —
+`source: "./"`). One plugin, `skills/` and `commands/` at top level.
+
 ```
-.claude-plugin/marketplace.json      # marketplace manifest (lists the plugin)
-mrg-skills/                          # the ONE plugin
-├── .claude-plugin/plugin.json       # plugin manifest
-├── skills/                          # many skills live here
-│   └── ug-coding-loop/
-│       ├── SKILL.md                 # frontmatter: name + description
-│       └── scripts/…                # optional supporting files
-└── commands/                        # optional explicit slash commands
-    └── ug-coding-loop.md            # /ug-coding-loop
+.claude-plugin/
+├── marketplace.json                 # marketplace manifest (source: "./")
+└── plugin.json                      # plugin manifest (name: mrg-skills)
+skills/                              # many skills live here
+└── ug-coding-loop/
+    ├── SKILL.md                     # frontmatter: name: ug-coding-loop
+    └── scripts/…                    # optional supporting files
+commands/                            # optional explicit slash commands
+└── ug-coding-loop.md                # /ug-coding-loop
 ```
+
+Skill resolves as `ug-coding-loop` (namespaced `mrg-skills:ug-coding-loop`),
+command as `/ug-coding-loop`. The plugin is named `mrg-skills`; individual
+skills keep their own names from each `SKILL.md`.
 
 ## Enable globally (one time)
 
@@ -39,7 +46,7 @@ every session, on every repo.
 
 ## Add a future skill (no settings edit)
 
-1. Create `mrg-skills/skills/<name>/SKILL.md` with YAML frontmatter:
+1. Create `skills/<name>/SKILL.md` with YAML frontmatter:
 
    ```markdown
    ---
@@ -52,8 +59,7 @@ every session, on every repo.
 
    Add optional `scripts/`, `references/`, or `assets/` under the same folder.
 
-2. (Optional) Expose an explicit slash command —
-   `mrg-skills/commands/<name>.md`:
+2. (Optional) Expose an explicit slash command — `commands/<name>.md`:
 
    ```markdown
    ---
