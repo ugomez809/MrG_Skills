@@ -112,5 +112,5 @@ Alternatively, for a single repo, commit the skill as project files:
   and signs off, cheap parallel Sonnet agents build, two Opus reviewers gate
   each cycle. Skill + `/ug-coding-loop` slash command.
 - **ug-full-reviewer** — full-repo health audit: finds concrete, verified
-  bugs, security holes, architecture debt, and performance issues. Skill +
+  bugs, security defects, architecture debt, and performance issues. Skill +
   `/ug-full-reviewer` slash command.

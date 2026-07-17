@@ -2,7 +2,7 @@
 name: ug-full-reviewer
 description: >
   Full-repo health audit that finds concrete, verified problems to fix — bugs,
-  security holes, architecture debt, and performance issues. Uses a Graphify
+  security defects, architecture debt, and performance issues. Uses a Graphify
   knowledge graph when one exists (graphify-out/graph.json) to prioritize
   hotspots, builds a lightweight map itself when one doesn't. Use when the user
   says "audit this repo", "full analysis", "what needs fixing", "repo health
@@ -20,7 +20,7 @@ scenarios — not a tour of the codebase, not praise, not style opinions.
 Non-negotiable rules for every phase:
 
 - A finding without a concrete failure scenario ("input X in state Y → wrong
-  output / crash / exploit") is not a finding. Kill it.
+  output / crash / security defect") is not a finding. Kill it.
 - Never report a problem you have not read the actual source lines of.
 - No praise, no "overall the code is well-structured", no restating what code
   does. Only defects and the fix direction.
@@ -83,12 +83,13 @@ Dimensions and what each hunts:
    unhandled error paths, race conditions, resource leaks, null/None flows,
    wrong async handling (unawaited promises, missing cancellation), silent
    exception swallowing, dead branches that mask failures.
-2. **Security** — hardcoded secrets (also scan git history:
-   `git log -p -S` on obvious key patterns if suspicious), injection (SQL,
-   shell, template, path traversal), missing authz checks on mutating routes,
-   unsafe deserialization, permissive CORS, outdated deps with known CVEs
-   (run the ecosystem's audit tool: `npm audit`, `pip-audit`, `cargo audit`,
-   `govulncheck` — whichever exists).
+2. **Security** — defensive review of the current source only. Look for:
+   secrets committed into tracked files, injection-prone sinks (SQL, shell,
+   template, path traversal) reachable from untrusted input, missing authz
+   checks on mutating routes, unsafe deserialization, permissive CORS. Report
+   each as a code-quality defect with a concrete failure scenario. Do NOT scan
+   git history and do NOT run external audit or vulnerability-scanning tools —
+   review the code as written.
 3. **Architecture & debt** — dead code (exported-but-never-imported; the graph
    makes this cheap: zero-in-degree nodes), copy-paste duplication, circular
    imports (graph cycles), god modules doing 5 jobs, missing tests on the
