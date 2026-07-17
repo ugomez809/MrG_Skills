@@ -52,13 +52,21 @@ that script (see [`setup.sh`](./setup.sh)):
 
 ```bash
 claude plugin marketplace add ugomez809/MrG_Skills || true
+claude plugin marketplace update mrg-skills || true
 claude plugin install mrg-skills@mrg-skills || true
 ```
 
-They sit alongside the same `claude plugin marketplace add` / `claude plugin
-install` lines that load caveman, superpowers, and codex. A new web session
-after saving loads `ug-coding-loop` and `/ug-coding-loop` on any repo. Setup
-Script location: https://code.claude.com/docs/en/claude-code-on-the-web
+The `update` line matters: `marketplace add` skips a marketplace that already
+exists, so reused containers keep a **stale clone** and never see newly added
+skills. `update` re-pulls latest `main` before install. These sit alongside the
+same lines that load caveman, superpowers, and codex. A new web session after
+saving loads every skill on any repo. Setup Script location:
+https://code.claude.com/docs/en/claude-code-on-the-web
+
+To force a refresh inside an already-running web session, run in its terminal:
+`claude plugin marketplace remove mrg-skills && claude plugin marketplace add
+ugomez809/MrG_Skills && claude plugin install mrg-skills@mrg-skills`, then
+restart the session.
 
 Alternatively, for a single repo, commit the skill as project files:
 `.claude/skills/ug-coding-loop/SKILL.md` and
