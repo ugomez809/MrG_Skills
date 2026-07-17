@@ -103,3 +103,6 @@ Alternatively, for a single repo, commit the skill as project files:
 - **ug-coding-loop** — tiered, multi-model build-and-verify loop. Fable plans
   and signs off, cheap parallel Sonnet agents build, two Opus reviewers gate
   each cycle. Skill + `/ug-coding-loop` slash command.
+- **ug-full-reviewer** — full-repo health audit: finds concrete, verified
+  bugs, security holes, architecture debt, and performance issues. Skill +
+  `/ug-full-reviewer` slash command.
