@@ -68,6 +68,46 @@ const collectIssues = (verdicts) =>
   verdicts.filter(Boolean).flatMap(v => (v.blocking_issues || []).map(i =>
     typeof i === 'string' ? { problem: i } : i))
 
+// --- Targeted re-run: attribute each rework issue to the work item that owns
+// the file it names, so a cycle re-runs only the implicated coders and carries
+// every other item's prior build forward. Safe because work items own DISJOINT
+// files, so an item whose files appear in no issue does not need rework. When an
+// issue can't be pinned to a file (a smoke failure, a component-name issue, or an
+// item that declared no files) we conservatively re-run ALL coders — never skip a
+// needed fix.
+const itemFiles = (it) => (it.files || []).map(f => f.replace(/^\.\//, ''))
+// Best-effort file path out of an issue's `where`/`file` field. Returns '' when
+// it names no path (e.g. a component name or the smoke gate).
+const issueFile = (iss) => {
+  const w = String(iss.where || iss.file || '').trim()
+  const tok = w.split(/[\s(]/)[0]      // drop " or component", "(...)" tails
+  const path = tok.split(':')[0]       // drop :line[:col]
+  return /[./]/.test(path) ? path.replace(/^\.\//, '') : ''
+}
+// Disjoint ownership => a file maps to at most one item. Suffix-match so
+// "src/app.py:142" resolves against an owned "src/app.py" regardless of prefix.
+const ownersOf = (file, items) => !file ? [] :
+  items.filter(it => itemFiles(it).some(of =>
+    of === file || of.endsWith('/' + file) || file.endsWith('/' + of) || of.endsWith(file) || file.endsWith(of)))
+// Decide which coders run this cycle and each one's scoped issue slice.
+//   fixList == null  -> first build: every item runs fresh (issues: null).
+//   all issues attributable -> only implicated items run, each gets its own issues.
+//   any unattributable (incl. empty fixList, missing files) -> re-run ALL,
+//     unattributed issues handed to every coder.
+const planRework = (items, fixList) => {
+  if (!fixList) return items.map((it) => ({ item: it, issues: null }))
+  const missingFiles = items.some(it => itemFiles(it).length === 0)
+  const attributed = fixList.map(iss => ({ iss, owners: ownersOf(issueFile(iss), items).map(it => it.id) }))
+  const fallbackAll = missingFiles || attributed.length === 0 || attributed.some(a => a.owners.length === 0)
+  const pool = fallbackAll ? items : items.filter(it => attributed.some(a => a.owners.includes(it.id)))
+  return pool.map(it => ({
+    item: it,
+    issues: attributed
+      .filter(a => a.owners.includes(it.id) || (fallbackAll && a.owners.length === 0))
+      .map(a => a.iss),
+  }))
+}
+
 // -------------------------------- schemas ---------------------------------
 const PLAN_SCHEMA = {
   type: 'object',
@@ -163,7 +203,7 @@ ${j(PLAN.acceptance_criteria)}
 
 YOUR WORK ITEM:
 ${j(item)}
-${fixList ? `\nThis is a RE-WORK pass. Independent reviewers rejected the previous attempt. Fix these issues that fall within your files — ignore ones outside your ownership:\n${j(fixList)}\n` : ''}
+${fixList ? `\nThis is a RE-WORK pass. Independent reviewers rejected the previous attempt. These issues are already scoped to your files — fix each one:\n${j(fixList)}\n` : ''}
 Work test-first: invoke superpowers:test-driven-development if the Skill tool is available and follow it — write the failing test, watch it fail, then the minimal code to pass. That is how you know the test tests the right thing. ${fixList ? 'Since this is rework triggered by a reviewer failure, invoke superpowers:systematic-debugging (or apply it) and find the ROOT CAUSE before changing anything — a symptom patch that hides the real bug is a failure.' : ''}
 
 Code lazily (ponytail — "the best code is the code you never wrote"). Before writing anything, walk this ladder in order: (1) does this need to exist at all? (2) does code already in this repo do it — reuse, don't rewrite; (3) does the standard library do it? (4) does a native platform feature cover it? (5) does an already-installed dependency solve it? (6) can it be one line? Only after all six: write minimum working code. No new abstractions, no unasked-for boilerplate, no extra dependencies; prefer deletion over addition. Be lazy about the solution, NEVER about reading — understand the problem fully first. When two equally small options exist, pick the edge-case-correct one. Mark intentional simplifications with a 'ponytail:' comment noting the ceiling and upgrade path. These are never negotiable and never trimmed: input validation at trust boundaries, error handling that prevents data loss, security, accessibility, and anything the task explicitly asks for.
@@ -236,18 +276,26 @@ let fixList = null
 let lastBuilds = null
 let status = 'exhausted'
 let cycle = 0
+// Latest build result per work item, persisted across cycles so a targeted
+// rework carries untouched items forward instead of rebuilding them.
+const buildsById = new Map()
 
 while (cycle < MAX_CYCLES) {
   if (belowBudget()) { status = 'budget-stopped'; log(`Stop. Token floor hit before cycle ${cycle + 1}.`); break }
   cycle++
 
-  // BUILD — parallel Sonnet, one per work item.
+  // BUILD — parallel Sonnet. First cycle builds every work item; rework cycles
+  // re-run only the coders whose files the reviewers' issues implicate, each fed
+  // just its own issues, and carry every other item's prior build forward.
   phase('Build')
   const items = PLAN.work_items
-  const built = await parallel(items.map((it, i) => () =>
-    agent(buildPrompt(it, fixList), { label: `build:${it.id || i}`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
-  lastBuilds = built.filter(Boolean)
-  log(`cycle ${cycle}: ${lastBuilds.length}/${items.length} coder(s) done. [${fmtK(spentSoFar())} tok]`)
+  const jobs = planRework(items, fixList)
+  if (fixList) log(`cycle ${cycle}: rework ${jobs.length}/${items.length} item(s); ${items.length - jobs.length} carried forward. [${fmtK(spentSoFar())} tok]`)
+  const ran = await parallel(jobs.map(({ item, issues }, i) => () =>
+    agent(buildPrompt(item, issues), { label: `build:${item.id || i}`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
+  ran.forEach((b, k) => { if (b) buildsById.set(jobs[k].item.id || jobs[k].item.title || k, b) })
+  lastBuilds = [...buildsById.values()]
+  log(`cycle ${cycle}: ${ran.filter(Boolean).length}/${jobs.length} coder(s) done, ${lastBuilds.length}/${items.length} item(s) built. [${fmtK(spentSoFar())} tok]`)
 
   // SMOKE — optional Haiku tripwire between Build and Verify. If the plan
   // defined an objective check and it fails, both Opus reviewers are skipped

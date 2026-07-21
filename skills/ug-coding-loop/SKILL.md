@@ -67,7 +67,19 @@ Fable: audit + plan + acceptance criteria + file-disjoint work items   (once)
 Report: status, cycles used, what shipped, any outstanding issues
 ```
 
-Two design choices worth understanding, because they are what make this cheap:
+**Targeted rework — only the implicated coders re-run.** A rework cycle does not
+re-spawn every coder. Each reviewer issue names a file; the loop maps that file
+to the work item that owns it (work items own disjoint files, so the mapping is
+1:1) and re-runs only those coders, each handed just its own issues. Every
+untouched item carries its previous build forward — reviewers still grade the
+merged whole. When an issue can't be pinned to a file — a smoke-gate failure (a
+red test command names no item), a component-name issue, or a plan whose items
+declared no files — the loop conservatively re-runs all coders, so a needed fix
+is never skipped. This is the disjoint-files invariant paying off twice: it makes
+parallel building safe AND makes targeted rework safe, and it's the biggest
+per-cycle token saver after the first build.
+
+Two more design choices worth understanding, because they are what make this cheap:
 
 1. **Fable is bookended, not looped.** The expensive model runs once to plan and
    once (per green) to bless. Rework cycles are Sonnet→Opus only. If Opus is a
