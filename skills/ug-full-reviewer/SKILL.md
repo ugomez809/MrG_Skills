@@ -5,11 +5,10 @@ description: >
   security defects, architecture debt, and performance issues. Reads an existing
   Graphify knowledge graph (graphify-out/graph.json) to prioritize hotspots and
   builds a lightweight map itself when there isn't one — it never generates a
-  graph. Use when the user
-  says "audit this repo", "full analysis", "what needs fixing", "repo health
-  check", "find issues in this project", or invokes /ug-full-reviewer. Output is
-  a dated, severity-ranked report under audits/ where every ranked finding
-  survived adversarial verification.
+  graph. Use when the user says "audit this repo", "full analysis", "what needs
+  fixing", "repo health check", "find issues in this project", or invokes
+  /ug-full-reviewer. Output is a dated, severity-ranked report under audits/
+  where every ranked finding survived adversarial verification.
 ---
 
 # Repo Audit
