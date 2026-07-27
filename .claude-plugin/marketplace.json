@@ -5,7 +5,7 @@
     {
       "name": "mrg-skills",
       "source": "./",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "description": "Ulises Gomez personal Claude Code skills"
     }
   ]

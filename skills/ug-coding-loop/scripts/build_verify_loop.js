@@ -374,16 +374,16 @@ const buildsById = new Map()
 // a dead-coder retry cycle: the next cycle rebuilds just the missing items
 // instead of re-spawning every coder over work already in the workspace.
 const doneThisRound = new Set()
-// Smoke-attribution state machine: 'fresh' (may target), 'targeted' (last red
-// was handled by targeted attribution — another red means the attribution was
-// wrong, escalate), 'escalated' (STAY on full re-runs; no targeted/full
-// ping-pong). Only a smoke pass resets to 'fresh'.
-let smokeMode = 'fresh'
-// Consecutive red smoke checks. Three in a row (one targeted attempt + two
-// full re-runs) means the command itself may be unfixable by any coder (bad
-// cwd, missing dep nobody owns) — stop as 'stalled' instead of burning the
-// remaining cycles on full-team rebuilds. Reset on green; a dead smoke agent
-// changes nothing (no new information).
+// Consecutive red smoke checks — doubles as the attribution state: only the
+// FIRST red in a streak (reds === 0) may target implicated files; any later
+// red means a targeted or full attempt already failed, so everyone re-runs
+// (sticky — no targeted/full ping-pong). Three in a row means the command
+// itself may be unfixable by any coder (bad cwd, missing dep nobody owns) —
+// stop as 'stalled' instead of burning the remaining cycles on full-team
+// rebuilds. Reset on green; a dead smoke agent changes nothing (no new
+// information). Tradeoff of the single counter: a nameless first red followed
+// by a second red that DOES name files still re-runs everyone — mild extra
+// spend in a rare sequence, one less state machine to reason about.
 let smokeReds = 0
 // Green smoke evidence from THIS cycle, handed to the reviewers so they don't
 // burn tokens re-running a command a cheaper agent already proved exits 0.
@@ -499,7 +499,7 @@ while (cycle < MAX_CYCLES) {
     if (!smoke) smoke = await agent(smokePrompt(), { label: 'smoke:haiku:retry', phase: 'Smoke', model: MODELS.smoke, schema: SMOKE_SCHEMA })
     if (!smoke) {
       // Smoke agent died twice. The check never ran — do NOT record a pass. Fall
-      // through to Opus, which verifies the criteria itself anyway; smokeMode is
+      // through to Opus, which verifies the criteria itself anyway; smokeReds is
       // left untouched since no new smoke information exists.
       history.push({ cycle, gate: 'smoke', pass: null })
       log(`cycle ${cycle}: smoke agent unavailable — gate skipped, Opus verifies. [${fmtK(spentSoFar())} tok]`)
@@ -511,14 +511,14 @@ while (cycle < MAX_CYCLES) {
       // evidence also catches passing-test noise (a runner summary lists every
       // file it ran), so the sweep is a deterministic BACKSTOP used only when the
       // agent's list maps to nothing — not unioned in every time. If no named
-      // path maps to an item, or the state machine says a targeted attempt
-      // already failed, fall back to the nameless issue, which planRework()
+      // path maps to an item, or an earlier red in this streak already tried
+      // (smokeReds > 0), fall back to the nameless issue, which planRework()
       // turns into a full re-run.
       const evidence = (smoke.evidence || '').slice(0, 4000)
       const keepOwned = (paths) => [...new Set(paths.map(f => String(f).replace(/^\.\//, '')).filter(Boolean))]
         .filter(p => ownersOf(p, PLAN.work_items).length > 0)
-      let owned = smokeMode === 'fresh' ? keepOwned(smoke.implicated_files || []) : []
-      if (smokeMode === 'fresh' && !owned.length) owned = keepOwned(extractPaths(smoke.evidence))
+      let owned = smokeReds === 0 ? keepOwned(smoke.implicated_files || []) : []
+      if (smokeReds === 0 && !owned.length) owned = keepOwned(extractPaths(smoke.evidence))
       fixList = owned.length ? owned.map(f => ({
         problem: `Objective check failed: ${PLAN.smoke_command} — failure implicates this file`,
         where: f,
@@ -530,7 +530,6 @@ while (cycle < MAX_CYCLES) {
         fix: 'Make this command pass. Its raw failing output follows — work from it.',
         output: evidence,
       }]
-      smokeMode = smokeMode !== 'fresh' ? 'escalated' : (owned.length ? 'targeted' : 'fresh')
       smokeReds++
       history.push({ cycle, gate: 'smoke', pass: false, targeted: owned })
       if (smokeReds >= 3) {
@@ -541,7 +540,6 @@ while (cycle < MAX_CYCLES) {
       log(`cycle ${cycle}: smoke RED${owned.length ? ` — implicates ${owned.join(', ')}` : ' — no targeted attribution, full re-run'}. Skip Opus, back to Sonnet. [${fmtK(spentSoFar())} tok]`)
       continue
     } else {
-      smokeMode = 'fresh'
       smokeReds = 0
       smokeEvidence = (smoke.evidence || '').slice(0, 2000)
       history.push({ cycle, gate: 'smoke', pass: true })

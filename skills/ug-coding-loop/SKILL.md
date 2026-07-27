@@ -469,6 +469,20 @@ That adds real complexity and a merge step; only reach for it if the user
 explicitly needs heavy parallel edits to shared files, and say so before adding
 it.
 
+## Tests
+
+The script's pure logic (attribution, rework planning, stall detection, issue
+dedupe, plan intake) is covered by a standalone suite — no framework, exits
+non-zero on failure:
+
+```
+node skills/ug-coding-loop/tests/logic.test.js
+```
+
+The suite copies the pure functions verbatim (the script itself only runs
+inside the Workflow sandbox). If you edit `scripts/build_verify_loop.js`,
+update the copies in the test file and run it before shipping.
+
 ## When NOT to reach for this
 
 This loop spends real tokens across several models. It earns that cost when the
