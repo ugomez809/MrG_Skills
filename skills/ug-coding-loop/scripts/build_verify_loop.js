@@ -235,6 +235,19 @@ const BUILD_SCHEMA = {
   },
 }
 
+// Coder reports as sent to the reviewers and bless. tests_run is a raw command
+// dump that grows with the task and is interpolated into BOTH verify lanes and
+// bless every cycle — the one payload here that scales with plan size. The
+// graders are explicitly told not to trust coder self-reports (they gather
+// their own evidence), so the tail beyond a sample is decorative to them:
+// keep enough to see WHICH commands ran, drop the rest.
+const TESTS_RUN_CAP = 600
+const forGraders = (builds) => (builds || []).map(b => {
+  const t = String(b.tests_run || '')
+  return t.length <= TESTS_RUN_CAP ? b
+    : { ...b, tests_run: `${t.slice(0, TESTS_RUN_CAP)}\n…[${t.length - TESTS_RUN_CAP} chars trimmed — re-run the commands yourself; do not grade on this report]` }
+})
+
 // Identical raw-output blobs (per-file smoke issues share one evidence tail)
 // collapse to a single copy in a coder's prompt instead of repeating 4KB each.
 const dedupeOutputs = (list) => {
@@ -300,8 +313,8 @@ ${TASK}
 ACCEPTANCE CRITERIA — grade against EXACTLY these:
 ${j(PLAN.acceptance_criteria)}
 
-WHAT THE CODERS REPORT THEY DID:
-${j(builds)}
+WHAT THE CODERS REPORT THEY DID (self-reports, possibly trimmed — evidence to verify, not to trust):
+${j(forGraders(builds))}
 ${smokeEvidence ? `\nOBJECTIVE CHECK ALREADY GREEN THIS CYCLE: '${PLAN.smoke_command}' exited 0, run by the smoke gate just before this review. Its evidence:\n${smokeEvidence}\nDo not re-run that same command just to re-prove exit 0 — spend your review inspecting the actual code and verifying the criteria that command does not cover. Criteria needing OTHER commands still require you to run them yourself.\n` : ''}${reworkNote ? `\nREWORK CYCLE. The previous round was rejected for these issues (raw failure output omitted). Verify EACH is now genuinely resolved, in addition to your own full pass over the criteria:\n${j(reworkNote.issues)}\nItems rebuilt this cycle: ${reworkNote.rebuilt.join(', ')}. All other items are unchanged since the previous round — focus fresh scrutiny on the rebuilt ones.\n` : ''}
 Apply superpowers:verification-before-completion (invoke it if available): the iron law is NO pass without fresh verification evidence gathered in THIS review. You may not mark a criterion met unless you ran or inspected the actual test/command yourself and saw it pass — cite that evidence. Do not trust the coders' self-reports; open the real files and run the checks.
 
@@ -317,8 +330,8 @@ ${TASK}
 ACCEPTANCE CRITERIA:
 ${j(PLAN.acceptance_criteria)}
 
-CODER REPORTS:
-${j(builds)}
+CODER REPORTS (self-reports, possibly trimmed — evidence to verify, not to trust):
+${j(forGraders(builds))}
 
 INDEPENDENT REVIEWER VERDICTS:
 ${j(verdicts)}

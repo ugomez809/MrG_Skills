@@ -50,6 +50,12 @@ const planRework = (items, fixList, forceAll) => {
       .map(a => a.iss),
   }))
 }
+const TESTS_RUN_CAP = 600
+const forGraders = (builds) => (builds || []).map(b => {
+  const t = String(b.tests_run || '')
+  return t.length <= TESTS_RUN_CAP ? b
+    : { ...b, tests_run: `${t.slice(0, TESTS_RUN_CAP)}\n…[${t.length - TESTS_RUN_CAP} chars trimmed — re-run the commands yourself; do not grade on this report]` }
+})
 const dedupeOutputs = (list) => {
   const seen = new Set()
   return list.map(iss => {
@@ -232,6 +238,19 @@ const ok = (label) => { passed++; console.log(`${String(passed).padStart(2)}) ${
   assert.strictEqual(out[0].output, 'BLOB')
   assert.strictEqual(out[3].output, undefined)
   ok('dedupeOutputs: one copy per identical blob')
+
+  const short = { item_id: 'a', tests_run: 'npm test -> OK' }
+  const long = { item_id: 'b', summary: 'kept', tests_run: 'x'.repeat(5000) }
+  const graded = forGraders([short, long, { item_id: 'c' }])
+  assert.strictEqual(graded[0], short)                                       // untouched, same object
+  assert.ok(graded[1].tests_run.length < 800)                                // capped
+  assert.ok(graded[1].tests_run.startsWith('x'.repeat(600)))                 // head kept
+  assert.ok(graded[1].tests_run.includes('4400 chars trimmed'))
+  assert.strictEqual(graded[1].summary, 'kept')                              // other fields intact
+  assert.strictEqual(long.tests_run.length, 5000)                            // source not mutated
+  assert.strictEqual(graded[2].tests_run, undefined)                         // missing field safe
+  assert.deepStrictEqual(forGraders(null), [])
+  ok('forGraders: caps tests_run for graders, leaves source untouched')
 }
 
 // --- stall detection --------------------------------------------------------
