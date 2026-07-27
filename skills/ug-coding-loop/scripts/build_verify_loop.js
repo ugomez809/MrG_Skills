@@ -91,11 +91,12 @@ const SMOKE_PATH_RE = /[A-Za-z0-9_@./-]+\.[A-Za-z]{1,4}(?::\d+)?/g
 const extractPaths = (text) => [...new Set((String(text || '').match(SMOKE_PATH_RE) || [])
   .map(t => t.split(':')[0].replace(/^\.\//, ''))
   .filter(Boolean))]
-// Disjoint ownership => a file maps to at most one item. Suffix-match so
-// "src/app.py:142" resolves against an owned "src/app.py" regardless of prefix.
+// Disjoint ownership => a file maps to at most one item. Suffix-match on a '/'
+// boundary so "app.py" resolves against an owned "src/app.py" (and vice versa)
+// but never against "webapp.py".
 const ownersOf = (file, items) => !file ? [] :
   items.filter(it => itemFiles(it).some(of =>
-    of === file || of.endsWith('/' + file) || file.endsWith('/' + of) || of.endsWith(file) || file.endsWith(of)))
+    of === file || of.endsWith('/' + file) || file.endsWith('/' + of)))
 // Decide which coders run this cycle and each one's scoped issue slice.
 //   fixList == null  -> first build: every item runs fresh (issues: null).
 //   all issues attributable -> only implicated items run, each gets its own issues.
@@ -103,14 +104,19 @@ const ownersOf = (file, items) => !file ? [] :
 //     unattributed issues handed to every coder.
 const planRework = (items, fixList) => {
   if (!fixList) return items.map((it) => ({ item: it, issues: null }))
-  const missingFiles = items.some(it => itemFiles(it).length === 0)
   const attributed = fixList.map(iss => ({ iss, owners: ownersOf(issueFile(iss), items).map(it => it.id) }))
-  const fallbackAll = missingFiles || attributed.length === 0 || attributed.some(a => a.owners.length === 0)
-  const pool = fallbackAll ? items : items.filter(it => attributed.some(a => a.owners.includes(it.id)))
+  // An issue naming no owned file could belong to anyone: full re-run. An item
+  // that declared no files could have caused any issue, so it always re-runs and
+  // sees every issue — but it no longer drags well-attributed issues into a
+  // global re-run of the file-owning items.
+  const fileless = new Set(items.filter(it => itemFiles(it).length === 0).map(it => it.id))
+  const fallbackAll = attributed.length === 0 || attributed.some(a => a.owners.length === 0)
+  const pool = fallbackAll ? items : items.filter(it =>
+    fileless.has(it.id) || attributed.some(a => a.owners.includes(it.id)))
   return pool.map(it => ({
     item: it,
     issues: attributed
-      .filter(a => a.owners.includes(it.id) || (fallbackAll && a.owners.length === 0))
+      .filter(a => a.owners.includes(it.id) || fileless.has(it.id) || (fallbackAll && a.owners.length === 0))
       .map(a => a.iss),
   }))
 }
@@ -188,6 +194,18 @@ const BUILD_SCHEMA = {
   },
 }
 
+// Identical raw-output blobs (per-file smoke issues share one evidence tail)
+// collapse to a single copy in a coder's prompt instead of repeating 4KB each.
+const dedupeOutputs = (list) => {
+  const seen = new Set()
+  return list.map(iss => {
+    if (!iss.output) return iss
+    if (seen.has(iss.output)) return { ...iss, output: '(same failing output as the issue above)' }
+    seen.add(iss.output)
+    return iss
+  })
+}
+
 // -------------------------------- prompts ---------------------------------
 const planPrompt = () => `You are the lead architect. Use the TOP-tier model's full judgement — this is one of only two moments an expensive model is spent on this task, so make it count.
 
@@ -214,7 +232,7 @@ ${j(PLAN.acceptance_criteria)}
 
 YOUR WORK ITEM:
 ${j(item)}
-${fixList ? `\nThis is a RE-WORK pass. Independent reviewers rejected the previous attempt. These issues are already scoped to your files — fix each one:\n${j(fixList)}\n` : ''}
+${fixList ? `\nThis is a RE-WORK pass. Independent reviewers rejected the previous attempt. These issues are already scoped to your files — fix each one:\n${j(dedupeOutputs(fixList))}\n` : ''}
 Work test-first: invoke superpowers:test-driven-development if the Skill tool is available and follow it — write the failing test, watch it fail, then the minimal code to pass. That is how you know the test tests the right thing. ${fixList ? 'Since this is rework triggered by a reviewer failure, invoke superpowers:systematic-debugging (or apply it) and find the ROOT CAUSE before changing anything — a symptom patch that hides the real bug is a failure.' : ''}
 
 Code lazily (ponytail — "the best code is the code you never wrote"). Before writing anything, walk this ladder in order: (1) does this need to exist at all? (2) does code already in this repo do it — reuse, don't rewrite; (3) does the standard library do it? (4) does a native platform feature cover it? (5) does an already-installed dependency solve it? (6) can it be one line? Only after all six: write minimum working code. No new abstractions, no unasked-for boilerplate, no extra dependencies; prefer deletion over addition. Be lazy about the solution, NEVER about reading — understand the problem fully first. When two equally small options exist, pick the edge-case-correct one. Mark intentional simplifications with a 'ponytail:' comment noting the ceiling and upgrade path. These are never negotiable and never trimmed: input validation at trust boundaries, error handling that prevents data loss, security, accessibility, and anything the task explicitly asks for.
@@ -233,7 +251,7 @@ Report green=true ONLY if the command exited with status 0 (append '; echo EXIT:
 
 Also fill implicated_files: list every file path that appears in the failure output (repo-relative when possible); empty list if none appear. Copy them from the output, do not infer paths that are not printed there.`
 
-const verifyPrompt = (builds, lane) => `You are independent reviewer ${lane}. You are one of two reviewers grading this work SEPARATELY — you cannot see the other reviewer, and you should assume they may miss things, so do your own thorough pass. Be skeptical: your job is to catch problems before an expensive top-tier review is spent.
+const verifyPrompt = (builds, lane, smokeEvidence) => `You are independent reviewer ${lane}. You are one of two reviewers grading this work SEPARATELY — you cannot see the other reviewer, and you should assume they may miss things, so do your own thorough pass. Be skeptical: your job is to catch problems before an expensive top-tier review is spent.
 
 OVERALL TASK:
 ${TASK}
@@ -243,7 +261,7 @@ ${j(PLAN.acceptance_criteria)}
 
 WHAT THE CODERS REPORT THEY DID:
 ${j(builds)}
-
+${smokeEvidence ? `\nOBJECTIVE CHECK ALREADY GREEN THIS CYCLE: '${PLAN.smoke_command}' exited 0, run by the smoke gate just before this review. Its evidence:\n${smokeEvidence}\nDo not re-run that same command just to re-prove exit 0 — spend your review inspecting the actual code and verifying the criteria that command does not cover. Criteria needing OTHER commands still require you to run them yourself.\n` : ''}
 Apply superpowers:verification-before-completion (invoke it if available): the iron law is NO pass without fresh verification evidence gathered in THIS review. You may not mark a criterion met unless you ran or inspected the actual test/command yourself and saw it pass — cite that evidence. Do not trust the coders' self-reports; open the real files and run the checks.
 
 Pass ONLY if every acceptance criterion is genuinely met; default to pass=false when uncertain — a false green wastes the top model's time. Write each blocking issue in FULL precise detail: file:line, expected-vs-actual, and a concrete fix the next coder can act on directly. Do NOT compress or caveman these issue reports — the next cycle acts on exactly what you write, so specificity is the point.
@@ -292,10 +310,14 @@ let cycle = 0
 // Latest build result per work item, persisted across cycles so a targeted
 // rework carries untouched items forward instead of rebuilding them.
 const buildsById = new Map()
-// True when the previous cycle's smoke failure was handled by targeted
-// attribution. Escalation guard: a second consecutive red smoke means the
-// attribution was wrong, so the next one re-runs everything. Reset on green.
-let smokeWasTargeted = false
+// Smoke-attribution state machine: 'fresh' (may target), 'targeted' (last red
+// was handled by targeted attribution — another red means the attribution was
+// wrong, escalate), 'escalated' (STAY on full re-runs; no targeted/full
+// ping-pong). Only a smoke pass resets to 'fresh'.
+let smokeMode = 'fresh'
+// Green smoke evidence from THIS cycle, handed to the reviewers so they don't
+// burn tokens re-running a command a cheaper agent already proved exits 0.
+let smokeEvidence = null
 
 while (cycle < MAX_CYCLES) {
   if (belowBudget()) { status = 'budget-stopped'; log(`Stop. Token floor hit before cycle ${cycle + 1}.`); break }
@@ -310,9 +332,24 @@ while (cycle < MAX_CYCLES) {
   if (fixList) log(`cycle ${cycle}: rework ${jobs.length}/${items.length} item(s); ${items.length - jobs.length} carried forward. [${fmtK(spentSoFar())} tok]`)
   const ran = await parallel(jobs.map(({ item, issues }, i) => () =>
     agent(buildPrompt(item, issues), { label: `build:${item.id || i}`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
+  // Retry dead coders once, in parallel.
+  const deadIdx = ran.map((b, k) => b ? -1 : k).filter(k => k >= 0)
+  if (deadIdx.length) {
+    const retried = await parallel(deadIdx.map(k => () =>
+      agent(buildPrompt(jobs[k].item, jobs[k].issues), { label: `build:${jobs[k].item.id || k}:retry`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
+    retried.forEach((b, i) => { if (b) ran[deadIdx[i]] = b })
+  }
   ran.forEach((b, k) => { if (b) buildsById.set(jobs[k].item.id || jobs[k].item.title || k, b) })
   lastBuilds = [...buildsById.values()]
   log(`cycle ${cycle}: ${ran.filter(Boolean).length}/${jobs.length} coder(s) done, ${lastBuilds.length}/${items.length} item(s) built. [${fmtK(spentSoFar())} tok]`)
+  // A coder still dead after its retry means this build is knowingly incomplete —
+  // grading it wastes smoke/review spend. Re-run the cycle: fixList is unchanged,
+  // so the same jobs re-run; MAX_CYCLES bounds the retries.
+  if (ran.some(b => !b)) {
+    history.push({ cycle, gate: 'build', pass: false })
+    log(`cycle ${cycle}: ${ran.filter(b => !b).length} coder(s) unresponsive after retry — skip grading, retry cycle. [${fmtK(spentSoFar())} tok]`)
+    continue
+  }
 
   // SMOKE — optional Haiku tripwire between Build and Verify. If the plan
   // defined an objective check and it fails, both Opus reviewers are skipped
@@ -321,22 +358,33 @@ while (cycle < MAX_CYCLES) {
   // the raw result — no judgement, no fixes — so the cheapest model gets the
   // most mechanical job. A green smoke still goes through full Opus review,
   // so this adds no false-green risk.
+  smokeEvidence = null
   if (PLAN.smoke_command) {
     phase('Smoke')
-    const smoke = await agent(smokePrompt(), { label: 'smoke:haiku', phase: 'Smoke', model: MODELS.smoke, schema: SMOKE_SCHEMA })
-    if (smoke && !smoke.green) {
+    let smoke = await agent(smokePrompt(), { label: 'smoke:haiku', phase: 'Smoke', model: MODELS.smoke, schema: SMOKE_SCHEMA })
+    if (!smoke) smoke = await agent(smokePrompt(), { label: 'smoke:haiku:retry', phase: 'Smoke', model: MODELS.smoke, schema: SMOKE_SCHEMA })
+    if (!smoke) {
+      // Smoke agent died twice. The check never ran — do NOT record a pass. Fall
+      // through to Opus, which verifies the criteria itself anyway; smokeMode is
+      // left untouched since no new smoke information exists.
+      history.push({ cycle, gate: 'smoke', pass: null })
+      log(`cycle ${cycle}: smoke agent unavailable — gate skipped, Opus verifies. [${fmtK(spentSoFar())} tok]`)
+    } else if (!smoke.green) {
       // TARGETED_SMOKE_REWORK_V2 — a red smoke check names files in its output;
       // map those to the work items that own them and re-run only those coders,
-      // instead of re-running every coder over a nameless issue. Two sources are
-      // unioned: what the smoke agent reported, and a regex sweep of the raw
-      // evidence (the deterministic backstop, independent of the agent). If no
-      // named path maps to an item — or if the previous cycle already tried
-      // targeted attribution and smoke failed again, meaning the file showing the
-      // symptom was not the file causing it — fall back to the nameless issue,
-      // which planRework() turns into a full re-run.
+      // instead of re-running every coder over a nameless issue. The agent's
+      // implicated_files lists only failure paths; the regex sweep of the raw
+      // evidence also catches passing-test noise (a runner summary lists every
+      // file it ran), so the sweep is a deterministic BACKSTOP used only when the
+      // agent's list maps to nothing — not unioned in every time. If no named
+      // path maps to an item, or the state machine says a targeted attempt
+      // already failed, fall back to the nameless issue, which planRework()
+      // turns into a full re-run.
       const evidence = (smoke.evidence || '').slice(0, 4000)
-      const named = [...new Set([...(smoke.implicated_files || []).map(f => String(f).replace(/^\.\//, '')), ...extractPaths(smoke.evidence)])]
-      const owned = smokeWasTargeted ? [] : named.filter(p => ownersOf(p, PLAN.work_items).length > 0)
+      const keepOwned = (paths) => [...new Set(paths.map(f => String(f).replace(/^\.\//, '')).filter(Boolean))]
+        .filter(p => ownersOf(p, PLAN.work_items).length > 0)
+      let owned = smokeMode === 'fresh' ? keepOwned(smoke.implicated_files || []) : []
+      if (smokeMode === 'fresh' && !owned.length) owned = keepOwned(extractPaths(smoke.evidence))
       fixList = owned.length ? owned.map(f => ({
         problem: `Objective check failed: ${PLAN.smoke_command} — failure implicates this file`,
         where: f,
@@ -348,25 +396,50 @@ while (cycle < MAX_CYCLES) {
         fix: 'Make this command pass. Its raw failing output follows — work from it.',
         output: evidence,
       }]
-      smokeWasTargeted = owned.length > 0
+      smokeMode = smokeMode !== 'fresh' ? 'escalated' : (owned.length ? 'targeted' : 'fresh')
       history.push({ cycle, gate: 'smoke', pass: false, targeted: owned })
-      log(`cycle ${cycle}: smoke RED${owned.length ? ` — implicates ${owned.join(', ')}` : ' — no owned file named, full re-run'}. Skip Opus, back to Sonnet. [${fmtK(spentSoFar())} tok]`)
+      log(`cycle ${cycle}: smoke RED${owned.length ? ` — implicates ${owned.join(', ')}` : ' — no targeted attribution, full re-run'}. Skip Opus, back to Sonnet. [${fmtK(spentSoFar())} tok]`)
       continue
+    } else {
+      smokeMode = 'fresh'
+      smokeEvidence = (smoke.evidence || '').slice(0, 2000)
+      history.push({ cycle, gate: 'smoke', pass: true })
+      log(`cycle ${cycle}: smoke green. [${fmtK(spentSoFar())} tok]`)
     }
-    smokeWasTargeted = false
-    history.push({ cycle, gate: 'smoke', pass: true })
-    log(`cycle ${cycle}: smoke green. [${fmtK(spentSoFar())} tok]`)
   }
 
   // VERIFY — two independent Opus reviewers; both must pass.
+  if (belowBudget()) { status = 'budget-stopped'; log(`cycle ${cycle}: token floor hit before review.`); break }
   phase('Verify')
-  const [vA, vB] = await parallel([
-    () => agent(verifyPrompt(lastBuilds, 'A'), { label: 'verify:opus-A', phase: 'Verify', model: MODELS.reviewer, schema: VERDICT_SCHEMA }),
-    () => agent(verifyPrompt(lastBuilds, 'B'), { label: 'verify:opus-B', phase: 'Verify', model: MODELS.reviewer, schema: VERDICT_SCHEMA }),
-  ])
+  const reviewOnce = (lane, tag) => agent(verifyPrompt(lastBuilds, lane, smokeEvidence),
+    { label: `verify:opus-${lane}${tag || ''}`, phase: 'Verify', model: MODELS.reviewer, schema: VERDICT_SCHEMA })
+  // A dead reviewer, or a fail that names zero actionable issues, would send the
+  // loop into a rework cycle with an empty fix list — retry that lane once.
+  const review = async (lane) => {
+    let [v] = await parallel([() => reviewOnce(lane)])
+    if (!v || (!v.pass && collectIssues([v]).length === 0)) [v] = await parallel([() => reviewOnce(lane, ':retry')])
+    return v
+  }
+  // First build reviews in parallel. Rework cycles run the lanes sequentially:
+  // green needs BOTH, so when A fails, B's tokens are pure waste — fail-fast
+  // halves reviewer spend on red cycles at some wall-clock cost.
+  let vA, vB
+  if (fixList) {
+    vA = await review('A')
+    vB = (vA && vA.pass) ? await review('B') : null
+  } else {
+    ;[vA, vB] = await parallel([() => review('A'), () => review('B')])
+  }
   const opusGreen = vA && vB && vA.pass && vB.pass
   if (!opusGreen) {
     fixList = collectIssues([vA, vB])
+    if (fixList.length === 0) {
+      // Red gate with nothing to act on: reviewers died or refused to name
+      // issues, twice each. Rework can't proceed — stop honestly.
+      status = 'error'
+      log(`cycle ${cycle}: reviewer gate unavailable (agent failures, no actionable issues). Stopping.`)
+      break
+    }
     history.push({ cycle, gate: 'verify', pass: false, issue_count: fixList.length })
     log(`cycle ${cycle}: Opus gate FAIL. ${fixList.length} issue(s). Back to Sonnet, no Fable. [${fmtK(spentSoFar())} tok]`)
     continue

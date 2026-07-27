@@ -75,10 +75,11 @@ untouched item carries its previous build forward — reviewers still grade the
 merged whole.
 
 Smoke failures attribute the same way. A red command prints file paths — stack
-frames, compiler errors, failing-test headers — so the loop collects them from
-two independent sources (the paths Haiku reports in `implicated_files`, plus a
-regex sweep of the raw output as a deterministic backstop), keeps the ones that
-map to a work item, and files one issue per file. Only the owning coders re-run.
+frames, compiler errors, failing-test headers — so the loop takes the paths
+Haiku reports in `implicated_files` (failure paths only), falls back to a
+deterministic regex sweep of the raw output when that list maps to nothing,
+keeps the ones that map to a work item, and files one issue per file. Only the
+owning coders re-run.
 
 Two escape hatches keep the "never skip a needed fix" guarantee:
 
@@ -88,7 +89,8 @@ Two escape hatches keep the "never skip a needed fix" guarantee:
   and re-runs all coders.
 - **The same smoke check fails twice in a row** → the file showing the symptom
   wasn't the file causing it, so the second failure escalates to a full re-run
-  regardless of what the output names. The tracker resets whenever smoke passes.
+  regardless of what the output names — and *stays* escalated (no targeted/full
+  ping-pong) until a smoke pass resets the tracker.
 
 This is the disjoint-files invariant paying off twice: it makes parallel building
 safe AND makes targeted rework safe, and it's the biggest per-cycle token saver
@@ -104,7 +106,12 @@ Two more design choices worth understanding, because they are what make this che
 2. **Opus is unanimous.** Green requires *both* independent reviewers to pass. A
    false green is expensive here — it wastes a Fable call — so the gate is
    deliberately conservative. Two reviewers who cannot see each other catch
-   correlated mistakes a single reviewer would wave through.
+   correlated mistakes a single reviewer would wave through. On rework cycles
+   the two lanes run sequentially — the second reviewer only spawns if the
+   first passes, since one fail already sends the cycle back to Sonnet. That
+   halves reviewer spend on red cycles; first builds still review in parallel.
+   When the smoke gate is green, reviewers receive its evidence so they don't
+   re-run the same command just to re-prove exit 0.
 
 3. **Haiku guards Opus the way Opus guards Fable.** Each Opus review round costs
    roughly 15–20× a Haiku smoke run. When a build is objectively broken (the
@@ -128,8 +135,9 @@ outcome here. Run the script rather than hand-orchestrating.
 
 2. Create the **task checklist** before launching, so the user gets a durable,
    ticking summary alongside the live workflow tree (see "Progress display"
-   below). Create these five items with `TaskCreate`, mirroring the phase names
-   so the two boxes read consistently:
+   below). Create these items with `TaskCreate` (six, or five when the plan has
+   no smoke_command), mirroring the phase names so the two boxes read
+   consistently:
 
    - `Plan & acceptance criteria (Fable)`
    - `Build in parallel (Sonnet)`
@@ -291,7 +299,7 @@ don't try to make one do the other's job.
   shows the final outcome at a glance, including where things stalled if the loop
   didn't go green.
 
-Keep the checklist coarse (these five phase-level items). Do **not** poll the
+Keep the checklist coarse (these phase-level items only). Do **not** poll the
 running workflow to make the checklist tick live — that spends main-model tokens
 on polling for a cosmetic gain, which fights the whole point of this skill. If
 the user explicitly asks for a live-ticking checklist and accepts the cost, then
@@ -393,7 +401,7 @@ All model routing lives in one place — the `MODELS` constant at the top of
 `scripts/build_verify_loop.js`:
 
 ```js
-const MODELS = { top: 'fable', coder: 'sonnet', reviewer: 'opus' }
+const MODELS = { top: 'fable', coder: 'sonnet', reviewer: 'opus', smoke: 'haiku' }
 ```
 
 Swap these if the user's environment uses different names or wants a different
