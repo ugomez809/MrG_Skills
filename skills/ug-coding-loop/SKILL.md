@@ -50,7 +50,7 @@ The ladder, cheapest-used-most to most-expensive-used-least:
 Fable: audit + plan + acceptance criteria + file-disjoint work items   (once)
   │
   ▼
-┌─ cycle (max 6) ───────────────────────────────────────────────┐
+┌─ cycle (max 10, stall-guarded) ───────────────────────────────┐
 │ Sonnet ×N (parallel): build/rework the work items             │
 │ Haiku (if plan has smoke_command): run the objective check     │
 │   • check fails → raw output → next cycle                      │
@@ -96,7 +96,7 @@ This is the disjoint-files invariant paying off twice: it makes parallel buildin
 safe AND makes targeted rework safe, and it's the biggest per-cycle token saver
 after the first build.
 
-Two more design choices worth understanding, because they are what make this cheap:
+More design choices worth understanding, because they are what make this cheap:
 
 1. **Fable is bookended, not looped.** The expensive model runs once to plan and
    once (per green) to bless. Rework cycles are Sonnet→Opus only. If Opus is a
@@ -121,6 +121,14 @@ Two more design choices worth understanding, because they are what make this che
    else: it never codes, never reviews, never fixes. That's why it's safe at the
    bottom of the ladder. A green smoke still gets full Opus review, so it can
    save tokens but never leak a false green.
+
+4. **Rework reviews are focused, and stalls are detected.** On rework cycles the
+   reviewers receive the rejected issues and which items were rebuilt, so they
+   verify the fixes specifically instead of cold-reviewing from scratch. And the
+   loop watches for non-convergence: the same issue list twice in a row
+   escalates to one full re-run (every issue to every coder); a third identical
+   list stops the run as `stalled` — cycles are only spent while they're
+   actually buying progress toward green.
 
 ## How to run it
 
@@ -184,7 +192,7 @@ outcome here. Run the script rather than hand-orchestrating.
        task: "<same task>",
        context: "<same context>",
        plan: <the approved plan object from step 3>,
-       maxCycles: 6,          // optional; defaults to 6
+       maxCycles: 10,         // optional; defaults to 10
        minBudgetFloor: 40000  // optional; stop early if token headroom drops below this
      }
    })
@@ -217,9 +225,11 @@ outcome here. Run the script rather than hand-orchestrating.
 
    Report to the user in caveman style (see "Communication style" below) from the
    result object:
-   - `status`: `green` (Fable blessed it), `exhausted` (hit the cycle cap still
-     red), `budget-stopped` / `green-unblessed` (stopped on the token floor), or
-     `error`.
+   - `status`: `green` (blessed), `exhausted` (hit the cycle cap still red),
+     `stalled` (the same issues came back three cycles running — the loop
+     cannot converge on its own; hand the outstanding issues to the user),
+     `budget-stopped` / `green-unblessed` (stopped on the token floor, or the
+     bless agent was unavailable / named nothing actionable), or `error`.
    - `cycles`: how many build→verify rounds it took.
    - `final_builds`: what the coders changed (the edits are already in the
      workspace).
@@ -401,17 +411,28 @@ All model routing lives in one place — the `MODELS` constant at the top of
 `scripts/build_verify_loop.js`:
 
 ```js
-const MODELS = { top: 'fable', coder: 'sonnet', reviewer: 'opus', smoke: 'haiku' }
+const MODELS = { top: 'fable', topFallback: 'opus', coder: 'sonnet', reviewer: 'opus', smoke: 'haiku' }
 ```
 
-Swap these if the user's environment uses different names or wants a different
-assignment (e.g. a cheaper reviewer, or Opus as the top model when Fable isn't
-available). Change nothing else — every stage reads from this constant.
+The aliases resolve in the harness to the **newest available version** of each
+tier — fable, then the latest Opus, latest Sonnet, latest Haiku. Never pin a
+dated model ID here; an alias keeps the loop on the best version of each tier
+automatically when new models ship. When the top model is unavailable, plan and
+bless retry once on `topFallback` (the next-best tier) instead of failing the
+run — the coder stays on Sonnet regardless. Swap these only if the user's
+environment uses different names; change nothing else — every stage reads from
+this constant.
 
 Knobs the user is likely to ask about:
 
-- **Fewer/more cycles:** `maxCycles`. Lower it to cap cost harder; the loop
-  reports `exhausted` with outstanding issues rather than running forever.
+- **Fewer/more cycles:** `maxCycles` (default 10). Lower it to cap cost harder,
+  raise it (or set it very high) to let the loop genuinely run until green —
+  that's safe because two other brakes exist: the budget floor, and the stall
+  guard. When the same issue list comes back two cycles running, the loop
+  escalates once to a full re-run with every issue handed to every coder; if
+  the identical list returns a third time it stops as `stalled` instead of
+  burning cycles it cannot convert. So cycles are only spent while the loop is
+  actually converging.
 - **Harder cost ceiling:** `minBudgetFloor` plus a turn budget target. The loop
   checks remaining headroom before each cycle and before spending Fable, and
   stops cleanly instead of starving the rest of the turn.

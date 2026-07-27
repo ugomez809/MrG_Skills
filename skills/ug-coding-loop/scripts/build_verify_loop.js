@@ -19,8 +19,14 @@ export const meta = {
 //   reviewer= mid-tier. Two independent instances gate every cycle.
 // The whole point: the expensive model appears at exactly two moments, never
 // inside the retry churn — that is what keeps its token spend minimal.
+//
+// Aliases (fable/opus/sonnet/haiku) resolve in the harness to the NEWEST
+// available version of each tier — never pin a dated model ID here, or the
+// loop silently falls behind when a new version ships. topFallback is used
+// automatically when the top model is unavailable (its agent returns null):
+// plan and bless retry once on the next-best tier instead of failing the run.
 // ---------------------------------------------------------------------------
-const MODELS = { top: 'fable', coder: 'sonnet', reviewer: 'opus', smoke: 'haiku' }
+const MODELS = { top: 'fable', topFallback: 'opus', coder: 'sonnet', reviewer: 'opus', smoke: 'haiku' }
 
 // args may be a plain string (the task) or an object:
 //   { task, context?, maxCycles?, minBudgetFloor?, mode?, plan? }
@@ -46,7 +52,7 @@ const TASK = typeof _args === 'string' ? _args : (A.task ?? JSON.stringify(_args
 const CONTEXT = A.context ?? ''
 const MODE = A.mode === 'plan-only' ? 'plan-only' : 'full'
 const PROVIDED_PLAN = (A.plan && typeof A.plan === 'object') ? A.plan : null
-const MAX_CYCLES = Number.isFinite(A.maxCycles) ? A.maxCycles : 6
+const MAX_CYCLES = Number.isFinite(A.maxCycles) ? A.maxCycles : 10
 // Stop early if we would dip below this many output tokens of headroom (only
 // active when the turn set a budget target). Prevents a half-finished loop from
 // starving the rest of the turn.
@@ -102,21 +108,24 @@ const ownersOf = (file, items) => !file ? [] :
 //   all issues attributable -> only implicated items run, each gets its own issues.
 //   any unattributable (incl. empty fixList, missing files) -> re-run ALL,
 //     unattributed issues handed to every coder.
-const planRework = (items, fixList) => {
+const planRework = (items, fixList, forceAll) => {
   if (!fixList) return items.map((it) => ({ item: it, issues: null }))
   const attributed = fixList.map(iss => ({ iss, owners: ownersOf(issueFile(iss), items).map(it => it.id) }))
   // An issue naming no owned file could belong to anyone: full re-run. An item
   // that declared no files could have caused any issue, so it always re-runs and
   // sees every issue — but it no longer drags well-attributed issues into a
-  // global re-run of the file-owning items.
+  // global re-run of the file-owning items. forceAll is the stall-escalation
+  // override: targeted rework didn't converge, so everyone re-runs.
   const fileless = new Set(items.filter(it => itemFiles(it).length === 0).map(it => it.id))
-  const fallbackAll = attributed.length === 0 || attributed.some(a => a.owners.length === 0)
+  const fallbackAll = forceAll || attributed.length === 0 || attributed.some(a => a.owners.length === 0)
   const pool = fallbackAll ? items : items.filter(it =>
     fileless.has(it.id) || attributed.some(a => a.owners.includes(it.id)))
   return pool.map(it => ({
     item: it,
+    // Under forceAll the attribution itself is suspect, so every coder sees
+    // every issue rather than a possibly-wrong slice.
     issues: attributed
-      .filter(a => a.owners.includes(it.id) || fileless.has(it.id) || (fallbackAll && a.owners.length === 0))
+      .filter(a => forceAll || a.owners.includes(it.id) || fileless.has(it.id) || (fallbackAll && a.owners.length === 0))
       .map(a => a.iss),
   }))
 }
@@ -251,7 +260,7 @@ Report green=true ONLY if the command exited with status 0 (append '; echo EXIT:
 
 Also fill implicated_files: list every file path that appears in the failure output (repo-relative when possible); empty list if none appear. Copy them from the output, do not infer paths that are not printed there.`
 
-const verifyPrompt = (builds, lane, smokeEvidence) => `You are independent reviewer ${lane}. You are one of two reviewers grading this work SEPARATELY — you cannot see the other reviewer, and you should assume they may miss things, so do your own thorough pass. Be skeptical: your job is to catch problems before an expensive top-tier review is spent.
+const verifyPrompt = (builds, lane, smokeEvidence, reworkNote) => `You are independent reviewer ${lane}. You are one of two reviewers grading this work SEPARATELY — you cannot see the other reviewer, and you should assume they may miss things, so do your own thorough pass. Be skeptical: your job is to catch problems before an expensive top-tier review is spent.
 
 OVERALL TASK:
 ${TASK}
@@ -261,7 +270,7 @@ ${j(PLAN.acceptance_criteria)}
 
 WHAT THE CODERS REPORT THEY DID:
 ${j(builds)}
-${smokeEvidence ? `\nOBJECTIVE CHECK ALREADY GREEN THIS CYCLE: '${PLAN.smoke_command}' exited 0, run by the smoke gate just before this review. Its evidence:\n${smokeEvidence}\nDo not re-run that same command just to re-prove exit 0 — spend your review inspecting the actual code and verifying the criteria that command does not cover. Criteria needing OTHER commands still require you to run them yourself.\n` : ''}
+${smokeEvidence ? `\nOBJECTIVE CHECK ALREADY GREEN THIS CYCLE: '${PLAN.smoke_command}' exited 0, run by the smoke gate just before this review. Its evidence:\n${smokeEvidence}\nDo not re-run that same command just to re-prove exit 0 — spend your review inspecting the actual code and verifying the criteria that command does not cover. Criteria needing OTHER commands still require you to run them yourself.\n` : ''}${reworkNote ? `\nREWORK CYCLE. The previous round was rejected for these issues (raw failure output omitted). Verify EACH is now genuinely resolved, in addition to your own full pass over the criteria:\n${j(reworkNote.issues)}\nItems rebuilt this cycle: ${reworkNote.rebuilt.join(', ')}. All other items are unchanged since the previous round — focus fresh scrutiny on the rebuilt ones.\n` : ''}
 Apply superpowers:verification-before-completion (invoke it if available): the iron law is NO pass without fresh verification evidence gathered in THIS review. You may not mark a criterion met unless you ran or inspected the actual test/command yourself and saw it pass — cite that evidence. Do not trust the coders' self-reports; open the real files and run the checks.
 
 Pass ONLY if every acceptance criterion is genuinely met; default to pass=false when uncertain — a false green wastes the top model's time. Write each blocking issue in FULL precise detail: file:line, expected-vs-actual, and a concrete fix the next coder can act on directly. Do NOT compress or caveman these issue reports — the next cycle acts on exactly what you write, so specificity is the point.
@@ -290,7 +299,11 @@ const belowBudget = () => budget.total && budget.remaining() < BUDGET_FLOOR
 let PLAN = PROVIDED_PLAN
 if (!PLAN) {
   phase('Plan')
-  PLAN = await agent(planPrompt(), { label: 'plan:fable', phase: 'Plan', model: MODELS.top, schema: PLAN_SCHEMA })
+  PLAN = await agent(planPrompt(), { label: `plan:${MODELS.top}`, phase: 'Plan', model: MODELS.top, schema: PLAN_SCHEMA })
+  if (!PLAN) {
+    log(`top model unavailable — retrying plan on ${MODELS.topFallback}.`)
+    PLAN = await agent(planPrompt(), { label: `plan:${MODELS.topFallback}`, phase: 'Plan', model: MODELS.topFallback, schema: PLAN_SCHEMA })
+  }
   if (!PLAN) return { status: 'error', error: 'planning failed', cycles: 0 }
 } else {
   log('Approved plan provided. Skip Fable plan phase — no top-model tokens spent.')
@@ -318,6 +331,24 @@ let smokeMode = 'fresh'
 // Green smoke evidence from THIS cycle, handed to the reviewers so they don't
 // burn tokens re-running a command a cheaper agent already proved exits 0.
 let smokeEvidence = null
+// Verify/bless stall detection: the same issue list two cycles running means
+// targeted rework isn't converging — escalate to one full re-run (every coder,
+// every issue); if the identical list comes back a third time, stop as
+// 'stalled' instead of burning cycles on a loop that can't converge.
+let lastSig = null
+let sigRepeats = 0
+let forceFullRework = false
+const issueSig = (list) => JSON.stringify(list.map(i => [i.where || '', i.problem || '']).sort())
+// Returns true when the loop should stop (three identical lists).
+const trackStall = (list, cycle) => {
+  const sig = issueSig(list)
+  if (sig === lastSig) sigRepeats++
+  else { sigRepeats = 0; lastSig = sig }
+  if (sigRepeats >= 2) return true
+  forceFullRework = sigRepeats === 1
+  if (forceFullRework) log(`cycle ${cycle}: identical issues as last cycle — escalating to full re-run, all issues to all coders.`)
+  return false
+}
 
 while (cycle < MAX_CYCLES) {
   if (belowBudget()) { status = 'budget-stopped'; log(`Stop. Token floor hit before cycle ${cycle + 1}.`); break }
@@ -328,7 +359,15 @@ while (cycle < MAX_CYCLES) {
   // just its own issues, and carry every other item's prior build forward.
   phase('Build')
   const items = PLAN.work_items
-  const jobs = planRework(items, fixList)
+  const jobs = planRework(items, fixList, forceFullRework)
+  // What this cycle reworked, handed to the reviewers so they verify the fixes
+  // specifically instead of cold-reviewing everything from scratch. Output blobs
+  // stripped — reviewers gather their own evidence.
+  const reworkNote = fixList ? {
+    rebuilt: jobs.map(jb => jb.item.id || jb.item.title),
+    issues: fixList.map(({ output, ...rest }) => rest),
+  } : null
+  forceFullRework = false
   if (fixList) log(`cycle ${cycle}: rework ${jobs.length}/${items.length} item(s); ${items.length - jobs.length} carried forward. [${fmtK(spentSoFar())} tok]`)
   const ran = await parallel(jobs.map(({ item, issues }, i) => () =>
     agent(buildPrompt(item, issues), { label: `build:${item.id || i}`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
@@ -411,7 +450,7 @@ while (cycle < MAX_CYCLES) {
   // VERIFY — two independent Opus reviewers; both must pass.
   if (belowBudget()) { status = 'budget-stopped'; log(`cycle ${cycle}: token floor hit before review.`); break }
   phase('Verify')
-  const reviewOnce = (lane, tag) => agent(verifyPrompt(lastBuilds, lane, smokeEvidence),
+  const reviewOnce = (lane, tag) => agent(verifyPrompt(lastBuilds, lane, smokeEvidence, reworkNote),
     { label: `verify:opus-${lane}${tag || ''}`, phase: 'Verify', model: MODELS.reviewer, schema: VERDICT_SCHEMA })
   // A dead reviewer, or a fail that names zero actionable issues, would send the
   // loop into a rework cycle with an empty fix list — retry that lane once.
@@ -440,6 +479,12 @@ while (cycle < MAX_CYCLES) {
       log(`cycle ${cycle}: reviewer gate unavailable (agent failures, no actionable issues). Stopping.`)
       break
     }
+    if (trackStall(fixList, cycle)) {
+      status = 'stalled'
+      history.push({ cycle, gate: 'verify', pass: false, issue_count: fixList.length })
+      log(`cycle ${cycle}: same issues three cycles running — loop cannot converge, stopping. [${fmtK(spentSoFar())} tok]`)
+      break
+    }
     history.push({ cycle, gate: 'verify', pass: false, issue_count: fixList.length })
     log(`cycle ${cycle}: Opus gate FAIL. ${fixList.length} issue(s). Back to Sonnet, no Fable. [${fmtK(spentSoFar())} tok]`)
     continue
@@ -449,20 +494,43 @@ while (cycle < MAX_CYCLES) {
   // BLESS — single Fable review. Only reached when both reviewers already agree.
   if (belowBudget()) { status = 'green-unblessed'; log(`cycle ${cycle}: Opus green but token floor hit. Skip Fable bless.`); break }
   phase('Bless')
-  const bless = await agent(blessPrompt(lastBuilds, [vA, vB]), { label: 'bless:fable', phase: 'Bless', model: MODELS.top, schema: VERDICT_SCHEMA })
-  if (bless && bless.pass) {
+  let bless = await agent(blessPrompt(lastBuilds, [vA, vB]), { label: `bless:${MODELS.top}`, phase: 'Bless', model: MODELS.top, schema: VERDICT_SCHEMA })
+  if (!bless) {
+    log(`top model unavailable — retrying bless on ${MODELS.topFallback}.`)
+    bless = await agent(blessPrompt(lastBuilds, [vA, vB]), { label: `bless:${MODELS.topFallback}`, phase: 'Bless', model: MODELS.topFallback, schema: VERDICT_SCHEMA })
+  }
+  if (!bless) {
+    // Both reviewers already passed; a dead bless agent should not trigger an
+    // empty-fix-list rework. Report the honest state and stop.
+    status = 'green-unblessed'
+    log(`cycle ${cycle}: bless agent unavailable after fallback — Opus-green, unblessed.`)
+    break
+  }
+  if (bless.pass) {
     status = 'green'
     history.push({ cycle, gate: 'bless', pass: true })
-    log(`cycle ${cycle}: GREEN. Fable bless done. [${fmtK(spentSoFar())} tok total]`)
+    log(`cycle ${cycle}: GREEN. Bless done. [${fmtK(spentSoFar())} tok total]`)
     break
   }
   fixList = collectIssues([bless])
+  if (fixList.length === 0) {
+    // Rejected but named nothing actionable — rework can't act on that.
+    status = 'green-unblessed'
+    log(`cycle ${cycle}: bless rejected without actionable issues — Opus-green, unblessed. Review its summary manually.`)
+    break
+  }
+  if (trackStall(fixList, cycle)) {
+    status = 'stalled'
+    history.push({ cycle, gate: 'bless', pass: false, issue_count: fixList.length })
+    log(`cycle ${cycle}: same issues three cycles running — loop cannot converge, stopping. [${fmtK(spentSoFar())} tok]`)
+    break
+  }
   history.push({ cycle, gate: 'bless', pass: false, issue_count: fixList.length })
-  log(`cycle ${cycle}: Fable reject. ${fixList.length} issue(s). Back to Sonnet. [${fmtK(spentSoFar())} tok]`)
+  log(`cycle ${cycle}: bless reject. ${fixList.length} issue(s). Back to Sonnet. [${fmtK(spentSoFar())} tok]`)
 }
 
 return {
-  status,                    // planned | green | green-unblessed | budget-stopped | exhausted | error
+  status,                    // planned | green | green-unblessed | budget-stopped | stalled | exhausted | error
   cycles: cycle,
   plan: PLAN,
   final_builds: lastBuilds,
