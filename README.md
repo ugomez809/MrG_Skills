@@ -116,6 +116,15 @@ Bump `version` in **both** `.claude-plugin/plugin.json` and
 `.claude-plugin/marketplace.json` on every release. Installed copies only
 update when that number changes, so an unbumped fix never reaches anyone.
 
+A hook enforces this. Enable it once per clone (git does not do it for you):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+It rejects any commit that touches `skills/` without a version bump, and any
+commit where the two manifests disagree.
+
 ## Current skills
 
 - **ug-coding-loop** — tiered, multi-model build-and-verify loop. Fable plans

@@ -1,0 +1,41 @@
+#!/bin/sh
+# Block a commit that changes skills/ without bumping the plugin version.
+#
+# Installed copies only receive an update when `version` changes in BOTH
+# manifests, so an unbumped skill fix silently never reaches anyone. This repo
+# has missed that bump twice; hence the hook.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+PLUGIN=.claude-plugin/plugin.json
+MARKET=.claude-plugin/marketplace.json
+
+# Only care when a skill actually changed.
+git diff --cached --name-only | grep -q '^skills/' || exit 0
+
+# First quoted value after a "version" key. "HEAD:path" = committed, ":path" = staged.
+version_of() {
+  git show "$1" 2>/dev/null \
+    | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 | cut -d'"' -f4
+}
+
+committed=$(version_of "HEAD:$PLUGIN")
+staged=$(version_of ":$PLUGIN")
+staged_market=$(version_of ":$MARKET")
+
+if [ -n "$committed" ] && [ "$committed" = "$staged" ]; then
+  echo "pre-commit: skills/ changed but the version is still $staged." >&2
+  echo "  Installed copies update only when the version changes." >&2
+  echo "  Bump $PLUGIN and $MARKET, then record it in CHANGELOG.md." >&2
+  exit 1
+fi
+
+if [ "$staged" != "$staged_market" ]; then
+  echo "pre-commit: manifest versions disagree." >&2
+  echo "  $PLUGIN=$staged  $MARKET=$staged_market" >&2
+  echo "  Both must carry the same version; they have drifted apart before." >&2
+  exit 1
+fi
+
+exit 0
