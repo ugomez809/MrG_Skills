@@ -106,6 +106,16 @@ Alternatively, for a single repo, commit the skill as project files:
 3. Commit and push. Auto-available in every session — no `settings.json` edit,
    just restart Claude Code (or reload plugins).
 
+## Versioning
+
+One plugin, one version, shared by every skill — Claude Code has no per-skill
+version. [`CHANGELOG.md`](./CHANGELOG.md) records which skill each release
+actually changed.
+
+Bump `version` in **both** `.claude-plugin/plugin.json` and
+`.claude-plugin/marketplace.json` on every release. Installed copies only
+update when that number changes, so an unbumped fix never reaches anyone.
+
 ## Current skills
 
 - **ug-coding-loop** — tiered, multi-model build-and-verify loop. Fable plans
