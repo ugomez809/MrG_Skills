@@ -11,7 +11,7 @@ export const meta = {
 }
 
 // ---------------------------------------------------------------------------
-// Model routing. Edit these three values if your environment uses full model
+// Model routing. Edit these values if your environment uses full model
 // IDs instead of the short aliases. Everything downstream reads from here so
 // you only change names in one place.
 //   top     = smartest + most expensive. Used ONLY to plan and to bless. Rare.
@@ -51,8 +51,21 @@ const A = (typeof _args === 'object' && _args) ? _args : {}
 const TASK = typeof _args === 'string' ? _args : (A.task ?? JSON.stringify(_args))
 const CONTEXT = A.context ?? ''
 const MODE = A.mode === 'plan-only' ? 'plan-only' : 'full'
-const PROVIDED_PLAN = (A.plan && typeof A.plan === 'object') ? A.plan : null
-const MAX_CYCLES = Number.isFinite(A.maxCycles) ? A.maxCycles : 10
+// Validate a caller-provided plan before trusting it: the plan-gate flow hands
+// the approved plan back (possibly hand-edited), so nothing guarantees shape.
+// Missing work_items would crash the run; items missing `id` silently poison
+// targeting (undefined === undefined matches every id-less item in planRework),
+// so ids are synthesized for any item that lacks one.
+let PROVIDED_PLAN = null
+if (A.plan && typeof A.plan === 'object') {
+  const p = A.plan
+  if (Array.isArray(p.work_items) && p.work_items.length &&
+      Array.isArray(p.acceptance_criteria) && p.acceptance_criteria.length) {
+    p.work_items.forEach((it, i) => { if (!it.id) it.id = `item-${i + 1}` })
+    PROVIDED_PLAN = p
+  }
+}
+const MAX_CYCLES = Math.max(1, Number.isFinite(A.maxCycles) ? A.maxCycles : 10)
 // Stop early if we would dip below this many output tokens of headroom (only
 // active when the turn set a budget target). Prevents a half-finished loop from
 // starving the rest of the turn.
@@ -148,7 +161,7 @@ const PLAN_SCHEMA = {
       type: 'array', minItems: 1,
       items: {
         type: 'object', additionalProperties: false,
-        required: ['id', 'title', 'instructions'],
+        required: ['id', 'title', 'instructions', 'files'],
         properties: {
           id: { type: 'string' },
           title: { type: 'string' },
@@ -225,7 +238,7 @@ Do a real audit first: read the relevant files/state so your plan reflects reali
 1. A short summary of the task and the intended end state, plus plain_english — a jargon-free version a non-technical human will read to approve this plan before any agents run. Make the plain_english genuinely plain: what gets built, how the work splits, how we know it's done.
 2. acceptance_criteria — the objectively checkable conditions that mean "done". Independent reviewers will grade ONLY against these, so make them specific and testable (e.g. "npm test passes", "endpoint returns 400 on missing field", not "code is clean").
 2b. smoke_command — if ONE shell command can objectively exercise the criteria (a test suite, a build, a linter chain), provide it with its working directory baked in. A minimal-cost agent will run it after each build round and, when it fails, the expensive reviewers are skipped for that round — this is a major token saver, so provide it whenever a runnable check exists. Omit it when nothing runnable applies.
-3. work_items — a decomposition into pieces that can be built IN PARALLEL. Critical constraint: each work item must OWN a disjoint set of files. Two items must never edit the same file, because coders run concurrently in a shared workspace and would clobber each other. If the task cannot be cleanly split, return a single work item — that is correct and expected for small tasks.
+3. work_items — a decomposition into pieces that can be built IN PARALLEL. Critical constraint: each work item must OWN a disjoint set of files. Two items must never edit the same file, because coders run concurrently in a shared workspace and would clobber each other. ALWAYS fill each item's files array — list every file the item will create or edit (an empty array only for a genuinely non-file deliverable); targeted rework depends on this ownership map, and an item without files degrades rework to full re-runs. If the task cannot be cleanly split, return a single work item — that is correct and expected for small tasks.
 
 Method: follow superpowers:writing-plans — invoke that skill if you can reach the Skill tool, and either way apply its core: write each work item as a bite-sized task for a coder who knows the domain but nothing about this codebase; fold TDD in so each item's acceptance is a failing test made to pass; DRY, YAGNI. Write the acceptance_criteria in FULL, precise, testable language — do NOT abbreviate or caveman-compress them; vague criteria make "green" unverifiable and defeat the whole loop.
 
@@ -277,7 +290,7 @@ Pass ONLY if every acceptance criterion is genuinely met; default to pass=false 
 
 The coders work under a minimal-code mandate (ponytail): an implementation that meets every criterion with the least code is CORRECT, not lazy. Do not raise issues demanding abstractions, patterns, configurability, or features beyond the acceptance criteria — that churns the loop on ideology instead of defects. The exceptions that ARE always blocking regardless of criteria: missing input validation at trust boundaries, error handling gaps that risk data loss, security holes, and accessibility failures.`
 
-const blessPrompt = (builds, verdicts) => `You are the final authority, on the TOP-tier model. Two independent reviewers already passed this work; you are the last gate before it ships. This is the second and final moment an expensive model is spent here, so be comprehensive — look for whole-picture problems the per-item reviewers could miss: integration gaps, missed edge cases, whether the work truly satisfies the ORIGINAL intent (not just the letter of the criteria), regressions, and anything unsafe.
+const blessPrompt = (builds, verdicts, reworkNote) => `You are the final authority, on the TOP-tier model. Two independent reviewers already passed this work; you are the last gate before it ships. This is the second and final moment an expensive model is spent here, so be comprehensive — look for whole-picture problems the per-item reviewers could miss: integration gaps, missed edge cases, whether the work truly satisfies the ORIGINAL intent (not just the letter of the criteria), regressions, and anything unsafe.
 
 ORIGINAL TASK:
 ${TASK}
@@ -290,13 +303,14 @@ ${j(builds)}
 
 INDEPENDENT REVIEWER VERDICTS:
 ${j(verdicts)}
-
+${reworkNote ? `\nTHIS IS A RE-REVIEW after a rework cycle. The issues that triggered the rework (verify EACH is genuinely resolved before anything else):\n${j(reworkNote.issues)}\nItems rebuilt: ${reworkNote.rebuilt.join(', ')}.\n` : ''}
 Apply superpowers:verification-before-completion at the highest bar (invoke it if available): sign off only on evidence you gathered yourself in this pass — run the verification, don't inherit the reviewers' word for it. State what you ran. Inspect the real workspace state, not just the reports. The coders work under a minimal-code mandate (ponytail): judge whether the work meets the intent with the least code, not whether it's architecturally elaborate — but security, data-loss, trust-boundary, and accessibility gaps are always blocking. Pass ONLY if you would personally sign off on shipping this. If you reject, give concrete, fully-detailed fixes — the cheaper models will do the rework and you will review again.`
 
 // --------------------------------- run ------------------------------------
 const belowBudget = () => budget.total && budget.remaining() < BUDGET_FLOOR
 
 let PLAN = PROVIDED_PLAN
+if (A.plan && !PLAN) log('Provided plan invalid (missing/empty work_items or acceptance_criteria) — replanning from scratch.')
 if (!PLAN) {
   phase('Plan')
   PLAN = await agent(planPrompt(), { label: `plan:${MODELS.top}`, phase: 'Plan', model: MODELS.top, schema: PLAN_SCHEMA })
@@ -319,6 +333,7 @@ const history = []
 let fixList = null
 let lastBuilds = null
 let status = 'exhausted'
+let errMsg = null
 let cycle = 0
 // Latest build result per work item, persisted across cycles so a targeted
 // rework carries untouched items forward instead of rebuilding them.
@@ -338,7 +353,14 @@ let smokeEvidence = null
 let lastSig = null
 let sigRepeats = 0
 let forceFullRework = false
-const issueSig = (list) => JSON.stringify(list.map(i => [i.where || '', i.problem || '']).sort())
+// Fingerprint on the STABLE parts of an issue list: the set of implicated
+// files plus the issue count. Fresh reviewer agents reword problem text every
+// cycle, so verbatim prose never matches; files and counts repeat reliably.
+// Tradeoff: two DIFFERENT issues in the same files across cycles read as
+// "same" — that only widens the re-run once and, at three strikes, stops
+// honestly with the issues listed, both acceptable.
+const issueSig = (list) => JSON.stringify([list.length,
+  ...[...new Set(list.map(i => issueFile(i) || String(i.where || '').slice(0, 40)))].sort()])
 // Returns true when the loop should stop (three identical lists).
 const trackStall = (list, cycle) => {
   const sig = issueSig(list)
@@ -378,7 +400,24 @@ while (cycle < MAX_CYCLES) {
       agent(buildPrompt(jobs[k].item, jobs[k].issues), { label: `build:${jobs[k].item.id || k}:retry`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
     retried.forEach((b, i) => { if (b) ran[deadIdx[i]] = b })
   }
-  ran.forEach((b, k) => { if (b) buildsById.set(jobs[k].item.id || jobs[k].item.title || k, b) })
+  ran.forEach((b, k) => {
+    if (!b) return
+    const it = jobs[k].item
+    buildsById.set(it.id || it.title || k, b)
+    // Fold what the coder actually touched into its ownership: newly created
+    // files (its tests, helpers) become attributable to their author instead of
+    // forcing a full re-run when a later issue names them. This also gives an
+    // initially file-less item real ownership after its first build. A changed
+    // file already owned by ANOTHER item is a disjointness violation — warn,
+    // don't adopt it.
+    for (const raw of (b.changed_files || [])) {
+      const f = String(raw).replace(/^\.\//, '')
+      if (!f || itemFiles(it).includes(f)) continue
+      const other = ownersOf(f, items).filter(o => o !== it)
+      if (other.length) log(`warning: ${it.id} changed ${f}, owned by ${other[0].id} — disjoint-files invariant violated.`)
+      else (it.files = it.files || []).push(f)
+    }
+  })
   lastBuilds = [...buildsById.values()]
   log(`cycle ${cycle}: ${ran.filter(Boolean).length}/${jobs.length} coder(s) done, ${lastBuilds.length}/${items.length} item(s) built. [${fmtK(spentSoFar())} tok]`)
   // A coder still dead after its retry means this build is knowingly incomplete —
@@ -476,6 +515,7 @@ while (cycle < MAX_CYCLES) {
       // Red gate with nothing to act on: reviewers died or refused to name
       // issues, twice each. Rework can't proceed — stop honestly.
       status = 'error'
+      errMsg = 'reviewer gate unavailable: reviewers died or named no actionable issues, twice each'
       log(`cycle ${cycle}: reviewer gate unavailable (agent failures, no actionable issues). Stopping.`)
       break
     }
@@ -494,10 +534,10 @@ while (cycle < MAX_CYCLES) {
   // BLESS — single Fable review. Only reached when both reviewers already agree.
   if (belowBudget()) { status = 'green-unblessed'; log(`cycle ${cycle}: Opus green but token floor hit. Skip Fable bless.`); break }
   phase('Bless')
-  let bless = await agent(blessPrompt(lastBuilds, [vA, vB]), { label: `bless:${MODELS.top}`, phase: 'Bless', model: MODELS.top, schema: VERDICT_SCHEMA })
+  let bless = await agent(blessPrompt(lastBuilds, [vA, vB], reworkNote), { label: `bless:${MODELS.top}`, phase: 'Bless', model: MODELS.top, schema: VERDICT_SCHEMA })
   if (!bless) {
     log(`top model unavailable — retrying bless on ${MODELS.topFallback}.`)
-    bless = await agent(blessPrompt(lastBuilds, [vA, vB]), { label: `bless:${MODELS.topFallback}`, phase: 'Bless', model: MODELS.topFallback, schema: VERDICT_SCHEMA })
+    bless = await agent(blessPrompt(lastBuilds, [vA, vB], reworkNote), { label: `bless:${MODELS.topFallback}`, phase: 'Bless', model: MODELS.topFallback, schema: VERDICT_SCHEMA })
   }
   if (!bless) {
     // Both reviewers already passed; a dead bless agent should not trigger an
@@ -531,6 +571,7 @@ while (cycle < MAX_CYCLES) {
 
 return {
   status,                    // planned | green | green-unblessed | budget-stopped | stalled | exhausted | error
+  error: errMsg ?? undefined,
   cycles: cycle,
   plan: PLAN,
   final_builds: lastBuilds,

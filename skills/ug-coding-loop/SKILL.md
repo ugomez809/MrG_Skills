@@ -125,10 +125,15 @@ More design choices worth understanding, because they are what make this cheap:
 4. **Rework reviews are focused, and stalls are detected.** On rework cycles the
    reviewers receive the rejected issues and which items were rebuilt, so they
    verify the fixes specifically instead of cold-reviewing from scratch. And the
-   loop watches for non-convergence: the same issue list twice in a row
-   escalates to one full re-run (every issue to every coder); a third identical
-   list stops the run as `stalled` — cycles are only spent while they're
-   actually buying progress toward green.
+   loop watches for non-convergence: when consecutive rejections implicate the
+   same files with the same issue count (issue *prose* varies between fresh
+   reviewer agents, so files+count is the stable fingerprint), it escalates
+   once to a full re-run (every issue to every coder); a third repeat stops the
+   run as `stalled` — cycles are only spent while they're actually buying
+   progress toward green. Ownership also *grows* as coders work: files a coder
+   creates (its tests, helpers) are folded into its item, so later issues
+   naming them stay attributable, and a coder touching another item's file
+   logs a disjointness warning.
 
 ## How to run it
 
@@ -428,10 +433,10 @@ Knobs the user is likely to ask about:
 - **Fewer/more cycles:** `maxCycles` (default 10). Lower it to cap cost harder,
   raise it (or set it very high) to let the loop genuinely run until green —
   that's safe because two other brakes exist: the budget floor, and the stall
-  guard. When the same issue list comes back two cycles running, the loop
-  escalates once to a full re-run with every issue handed to every coder; if
-  the identical list returns a third time it stops as `stalled` instead of
-  burning cycles it cannot convert. So cycles are only spent while the loop is
+  guard. When consecutive rejections implicate the same files with the same
+  issue count, the loop escalates once to a full re-run with every issue
+  handed to every coder; a third repeat stops as `stalled` instead of burning
+  cycles it cannot convert. So cycles are only spent while the loop is
   actually converging.
 - **Harder cost ceiling:** `minBudgetFloor` plus a turn budget target. The loop
   checks remaining headroom before each cycle and before spending Fable, and
