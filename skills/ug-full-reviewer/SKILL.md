@@ -7,9 +7,8 @@ description: >
   hotspots, builds a lightweight map itself when one doesn't. Use when the user
   says "audit this repo", "full analysis", "what needs fixing", "repo health
   check", "find issues in this project", or invokes /ug-full-reviewer. Output is
-  a severity-ranked, dated audit report (audits/AUDIT-<date>-<sha>.md) where
-  every ranked finding survived adversarial verification and names a concrete
-  failure scenario.
+  a dated, severity-ranked report under audits/ where every ranked finding
+  survived adversarial verification.
 ---
 
 # Repo Audit
@@ -26,89 +25,82 @@ Non-negotiable rules for every phase:
 - No praise, no "overall the code is well-structured", no restating what code
   does. Only defects and the fix direction.
 - Prefer 8 confirmed findings over 40 plausible ones.
+- Respect the two agent caps: 16 finders (Phase 2), 15 skeptics (Phase 3).
 
 ## Phase 0 — Preflight (cheap, inline)
 
-1. `git rev-parse --show-toplevel` to confirm you're in a repo; `git log -1
-   --format=%ct` for HEAD timestamp; note dirty state. **If this is not a git
-   repo**: note "no git" and skip every git-dependent step from here on
-   (churn hotspots, graph freshness check, HEAD sha in the report header) —
-   map by directory structure and imports instead. Everything else still runs.
-2. Detect stack: read the manifest(s) present (package.json, pyproject.toml,
-   go.mod, Cargo.toml, composer.json, etc.). Note language(s), framework,
-   test runner, lockfile presence.
-3. Size check: count tracked **source** files, not everything — assets,
-   lockfiles, and vendored code must not inflate the fan-out tier:
+1. `git rev-parse --show-toplevel`; `git log -1 --format=%ct` for HEAD
+   timestamp; note dirty state. **Not a git repo**: note "no git" and skip every
+   git-dependent step below (churn, graph freshness, HEAD sha in the header);
+   map by directory structure and imports instead.
+2. Detect stack from the manifest(s) present (package.json, pyproject.toml,
+   go.mod, Cargo.toml, composer.json, …): language(s), framework, test runner,
+   lockfile.
+3. Count tracked **source** files — assets and vendored code must not inflate
+   the tier (no git: `find` with the same exclusions):
 
    ```
-   git ls-files \
-     | grep -Ev '(^|/)(vendor|node_modules|dist|build|out|generated|third_party|audits)/' \
-     | grep -Ev '\.(png|jpe?g|svg|gif|ico|lock|min\.js|map|pdf|woff2?)$' \
-     | wc -l
+   git ls-files | grep -Ev '(^|/)(vendor|node_modules|dist|build|out|generated|third_party|audits)/' | grep -Ev '\.(png|jpe?g|svg|gif|ico|lock|min\.js|map|pdf|woff2?)$' | wc -l
    ```
 
-   (No git: `find` with the same exclusions.) This sets the fan-out budget in
-   Phase 2:
-   - < 50 files: no subagents needed; run the dimensions yourself sequentially.
-   - 50–500: 4 dimension finders, whole-repo scope each.
-   - > 500: dimension × subsystem matrix (Phase 2), capped at 16 finders.
+   Tier: **under 50** — no subagents, run the dimensions yourself sequentially.
+   **50–500** — 4 dimension finders, whole-repo scope each. **over 500** —
+   dimension × subsystem matrix (Phase 2).
 
-   These same exclusions define finder scope in Phase 2: finders never audit
-   vendored/generated code, and never read prior audit reports
-   (`AUDIT*.md`, `audits/`) as source.
+   These exclusions also bound finder scope in Phase 2. Finders never audit
+   vendored or generated code, and never read prior reports (`audits/`,
+   `AUDIT*.md`) as source.
 
 ## Phase 1 — Get or build the map
 
-Graphify-aware, but never blocked on it:
+Graphify-aware, never blocked on it. Graph is **fresh** iff `graphify-out/graph.json`
+exists and its built-at commit equals HEAD — read that from the graph's own
+metadata SHA, else `git log -1 --format=%H -- graphify-out/graph.json`. Never
+use mtime; a fresh clone makes every file look new. Untracked graph with no
+metadata SHA counts as stale.
 
-1. **Graph exists and is fresh** — `graphify-out/graph.json` present AND its
-   built-at commit equals HEAD. Determine built-at from the graph's own
-   metadata SHA if it records one, else `git log -1 --format=%H --
-   graphify-out/graph.json`. Do NOT use file mtime — a fresh clone stamps
-   every file with clone time, so mtime makes any old graph look new.
-   An untracked graph with no metadata SHA counts as stale.
-   If fresh: read `GRAPH_REPORT.md` first (cheap summary), then pull from
-   `graph.json`: the community list and the top "god nodes" (most-connected).
-   If the Graphify MCP tools are available (`query_graph`, `get_neighbors`,
-   `shortest_path`), prefer them over parsing JSON by hand.
-2. **Graph exists but stale** (built-at ≠ HEAD, or undeterminable): regenerate
-   if the `graphify` CLI or `/graphify` skill is available (`graphify .` or
-   invoke the skill). If regeneration isn't available, use the stale graph but
-   say so in the report header — structure drifts slowly; a slightly stale
-   graph still beats no graph for prioritization.
-3. **No graph, Graphify available**: run `/graphify .` (or `graphify .`) once,
-   then proceed as case 1.
-4. **No graph, no Graphify**: build a manual map in ≤ ~15 commands / file
-   reads:
+1. **Fresh** — read `GRAPH_REPORT.md` first (cheap summary), then pull the
+   community list and top "god nodes" (most-connected) from `graph.json`.
+   Prefer the Graphify MCP tools (`query_graph`, `get_neighbors`,
+   `shortest_path`) over parsing JSON by hand.
+2. **Stale** — regenerate if the `graphify` CLI or `/graphify` skill is
+   available, then treat as fresh. If not, use the stale graph and say so in
+   the report header; structure drifts slowly.
+3. **No graph, Graphify available** — run `/graphify .` once, then case 1.
+4. **No graph, no Graphify** — build a manual map. Listings and the two
+   commands below are free; spend at most ~15 file reads on top:
    - Directory skeleton: `git ls-files` grouped by top-level dir.
    - Entry points: main/index files, route registrations, CLI entrypoints,
      exported package surface.
-   - Hotspots by churn: `git log --format= --name-only -n 300 | sort |
-     uniq -c | sort -rn | head -30` — high-churn files are where bugs live.
-     Drop paths that no longer exist (deleted/renamed files rank high in
-     churn but are dead ends), then keep the top ~20 survivors.
-   - Hotspots by fan-in — count which internal modules are imported most,
-     e.g. for JS/TS/Python:
-     `git grep -hoE "(from|import|require)[ (]+['\"][^'\"]+" -- '*.py' '*.ts' '*.tsx' '*.js' | sort | uniq -c | sort -rn | head -20`
-     (adapt the pattern and globs to the stack from Phase 0).
+   - Churn hotspots (dropping paths that no longer exist):
 
-Output of this phase, regardless of path: a **subsystem list** (5–12 named
-areas with their key files) and a **hotspot list** (10–20 files ranked by
-connectedness/churn). God nodes and high-churn files get audited first and
-deepest.
+     ```
+     git log --format= --name-only -n 300 | sort | uniq -c | sort -rn | awk '{print $2}' | while read f; do [ -f "$f" ] && echo "$f"; done | head -20
+     ```
+
+   - Fan-in hotspots — which internal modules get imported most (adapt the
+     globs to the stack from Phase 0):
+
+     ```
+     git grep -hoE "(from|import|require)[ (]+['\"][^'\"]+" -- '*.py' '*.ts' '*.tsx' '*.js' | sort | uniq -c | sort -rn | head -20
+     ```
+
+Output regardless of path: a **subsystem list** (5–12 named areas with their key
+files) and a **hotspot list** (10–20 files ranked by connectedness/churn). God
+nodes and high-churn files get audited first and deepest.
 
 ## Phase 2 — Fan out finders
 
 Four dimensions, run as parallel subagents when the harness supports it
 (Task/Agent tool, or a Workflow with one agent per cell). **Hard cap: 16
-finders total.** For repos > 500 files, that means 4 dimensions × the top-4
-hotspot subsystems — not the full subsystem list; subsystems left out of the
-matrix are covered only via the hotspot lists, and MUST be named in the
-report's coverage note as not deeply examined. Each finder gets: the subsystem
-list, its hotspot files, the stack summary from Phase 0, the exclusions from
-Phase 0 (vendored/generated dirs, `AUDIT*.md`, `audits/`), and the finding
-schema below. Scope each finder to a dimension (and to a subsystem slice when
-the repo is > 500 files) so no agent drowns.
+finders.** Over 500 files that means 4 dimensions × the top-4 hotspot
+subsystems, not the full subsystem list — subsystems left out of the matrix are
+covered only via the hotspot lists and MUST be named in the coverage note as
+not deeply examined. Under 50 files, skip subagents entirely and run the four
+dimensions yourself.
+
+Each finder gets: the subsystem list, its hotspot files, the Phase 0 stack
+summary, the Phase 0 exclusions, and the schema below.
 
 Dimensions and what each hunts:
 
@@ -144,14 +136,13 @@ failure_scenario: concrete input/state → concrete wrong outcome
 fix_direction: one or two sentences, not a full patch
 ```
 
-`line: n/a` and multi-file `file:` are allowed only for findings that are
-genuinely cross-file (missing tests, scattered config, circular imports) —
-single-location defects always get a real file:line anchor.
+`line: n/a` and multi-file `file:` are only for genuinely cross-file findings
+(missing tests, scattered config, circular imports). Single-location defects
+always get a real file:line anchor.
 
-Severity rubric (finders and skeptics both use this — do not improvise):
+Severity rubric — finders and skeptics both use this, do not improvise:
 
-- **critical**: exploitable now, or causes data loss/corruption in normal
-  operation.
+- **critical**: exploitable now, or data loss/corruption in normal operation.
 - **high**: wrong output or crash on realistic input, or a security defect
   needing only mild preconditions.
 - **medium**: wrong behavior on edge cases, resource leak, or debt with a
@@ -162,56 +153,63 @@ Finder prompt must also say: "Return raw findings only. No preamble, no
 praise, no summary of the codebase. If a dimension yields nothing real,
 return an empty list — do not invent findings to look productive."
 
-## Phase 3 — Adversarial verify
+## Phase 3 — Triage, then adversarially verify
 
-Findings from Phase 2 are hypotheses. **Every finding gets verified, every
-severity** — the report's claim is that nothing ranked survived without
-verification, so nothing skips this phase. First dedup: same file+line+claim
-from two finders is one finding. Then, for each finding, spawn a skeptic
-(parallel where possible) whose prompt is: "Try to REFUTE this finding. Read
-the actual code at file:line and its callers/guards. Default to refuted if
-the failure scenario can't actually occur (input validated upstream, path
-unreachable, framework handles it). Verdict: confirmed | refuted |
-plausible-unverified, one sentence why."
+Findings from Phase 2 are hypotheses. Verification is the expensive phase, so
+narrow before spending it:
 
-- **Critical findings get 2 independent skeptics; majority rules** (with the
-  original finder's claim as the third vote). A single lazy skeptic must not
-  be able to kill or pass a critical alone.
+1. **Dedup** — same file+line+claim from two finders is one finding.
+2. **Triage** — rank by severity and keep at most **12 candidates**. Everything
+   below the line is dropped: un-ranked, un-verified, never mentioned. This is
+   how "prefer 8 confirmed over 40 plausible" actually gets enforced.
+3. **Verify every candidate** — spawn a skeptic per candidate (parallel where
+   possible): "Try to REFUTE this finding. Read the actual code at file:line
+   and its callers/guards. Default to refuted if the failure scenario can't
+   occur (input validated upstream, path unreachable, framework handles it).
+   Verdict: confirmed | refuted | plausible-unverified, one sentence why."
+
+**Hard cap: 15 skeptics** across candidates, critical second votes, and
+retries. If you would exceed it, cut the lowest-severity candidates.
+
+- Criticals get 2 independent skeptics; majority rules, with the original
+  finder's claim as the third vote.
 - Refuted → drop silently.
-- Plausible-unverified → severity buys NOTHING here. One retry from a
-  different angle: a second skeptic, or better an objective check. Still
-  unverified after the retry → it does not enter the ranked findings; either
-  drop it or list it only in the clearly-labeled "Unconfirmed leads" appendix.
+- Plausible-unverified → severity buys nothing. One retry from a different
+  angle (second skeptic, or better an objective check). Still unverified → it
+  never enters the ranked findings; drop it, or list it in the "Unconfirmed
+  leads" appendix.
 - Cheap objective checks beat argument: if a finding is testable in one
-  command, run it instead of debating — but **side-effect-safe only**:
-  read-only commands, static checks, or the existing test suite when it is
-  plainly local/hermetic. Never run scripts that touch network, databases,
-  or external state as part of verification.
-- Small-repo path (< 50 files, no subagents): verification still happens —
-  run an explicit self-skepticism pass per finding inline, same prompt, same
-  verdicts.
+  command, run it — but **side-effect-safe only**: read-only commands, static
+  checks, or the existing test suite when it is plainly local and hermetic.
+  Never run anything touching network, databases, or external state.
+- Under 50 files (no subagents): verification still happens — an explicit
+  self-skepticism pass per candidate, same prompt, same verdicts.
 
 ## Phase 4 — Report
 
-Write the report to `audits/AUDIT-<YYYY-MM-DD>-<shortsha>.md` in the repo
-root, creating `audits/` if needed (no git → omit the sha). Never overwrite a
-previous report: if the name already exists (same-day rerun at the same sha),
-append `-2`, `-3`, … . If the repo is read-only, write to the working/scratch
-directory instead and say so.
+Filename comes from commands, never from memory — `date +%F` for the date and
+`git rev-parse --short HEAD` for the sha:
+
+```
+audits/AUDIT-<date>-<shortsha>.md      # no git → audits/AUDIT-<date>.md
+```
+
+Create `audits/` if missing. `ls audits/` first: never overwrite a previous
+report — on collision (same-day rerun at the same sha) append `-2`, `-3`, … .
+Repo read-only → write to the working/scratch dir and say so.
 
 1. Header: repo, HEAD sha, date, map source (fresh graph / stale graph /
-  manual), coverage note — what was NOT examined (skipped dirs, generated
-  code, vendored deps, subsystems left out of the finder matrix) and any
-  finder that returned empty.
-2. Findings, severity-ranked, critical first. Each: the schema fields plus
-   verification verdict. Only confirmed findings appear in this ranked list.
-3. "Fix order" — a short suggested sequence: quick wins (< 30 min each)
-   separated from structural work, dependencies between fixes noted.
-4. Optionally end with: top 3 findings as a checklist the user can hand
-   straight back ("fix these") — the audit's whole point is the next action.
-5. "Unconfirmed leads" appendix (only if any survived the Phase 3 retry as
-   plausible-unverified and you chose to keep them): clearly labeled as NOT
-   verified, never mixed into the ranked list.
+   manual), coverage note — what was NOT examined (skipped dirs, generated
+   code, vendored deps, subsystems left out of the matrix), any finder that
+   returned empty, and how many findings were triaged out unverified.
+2. Findings, severity-ranked, critical first. Each: the schema fields plus the
+   verification verdict. Only confirmed findings appear here.
+3. "Fix order" — quick wins (< 30 min each) separated from structural work,
+   dependencies between fixes noted.
+4. Optionally: top 3 findings as a checklist the user can hand straight back
+   ("fix these") — the audit's whole point is the next action.
+5. "Unconfirmed leads" appendix, only if any survived the Phase 3 retry and you
+   chose to keep them. Clearly labeled NOT verified, never mixed into the list.
 
 After writing the file, summarize the top findings in your reply — the file
 alone is not the deliverable; the user reads the chat first.
