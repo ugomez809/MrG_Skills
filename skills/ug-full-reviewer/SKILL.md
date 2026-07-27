@@ -2,9 +2,10 @@
 name: ug-full-reviewer
 description: >
   Full-repo health audit that finds concrete, verified problems to fix — bugs,
-  security defects, architecture debt, and performance issues. Uses a Graphify
-  knowledge graph when one exists (graphify-out/graph.json) to prioritize
-  hotspots, builds a lightweight map itself when one doesn't. Use when the user
+  security defects, architecture debt, and performance issues. Reads an existing
+  Graphify knowledge graph (graphify-out/graph.json) to prioritize hotspots and
+  builds a lightweight map itself when there isn't one — it never generates a
+  graph. Use when the user
   says "audit this repo", "full analysis", "what needs fixing", "repo health
   check", "find issues in this project", or invokes /ug-full-reviewer. Output is
   a dated, severity-ranked report under audits/ where every ranked finding
@@ -31,7 +32,7 @@ Non-negotiable rules for every phase:
 
 1. `git rev-parse --show-toplevel`; `git log -1 --format=%ct` for HEAD
    timestamp; note dirty state. **Not a git repo**: note "no git" and skip every
-   git-dependent step below (churn, graph freshness, HEAD sha in the header);
+   git-dependent step below (churn, graph age, HEAD sha in the header);
    map by directory structure and imports instead.
 2. Detect stack from the manifest(s) present (package.json, pyproject.toml,
    go.mod, Cargo.toml, composer.json, …): language(s), framework, test runner,
@@ -53,29 +54,38 @@ Non-negotiable rules for every phase:
 
 ## Phase 1 — Get or build the map
 
-Graphify-aware, never blocked on it. Graph is **fresh** iff `graphify-out/graph.json`
-exists and its built-at commit equals HEAD — read that from the graph's own
-metadata SHA, else `git log -1 --format=%H -- graphify-out/graph.json`. Never
-use mtime; a fresh clone makes every file look new. Untracked graph with no
-metadata SHA counts as stale.
+**Never generate a graph.** No `graphify` CLI, no `/graphify` skill, no MCP
+call that builds or refreshes one. An audit reads the repo; it does not write
+artifacts into it. Read an existing graph if there is one, otherwise map by
+hand — a missing graph is never a reason to stop or to build.
 
-1. **Fresh** — read `GRAPH_REPORT.md` first (cheap summary), then pull the
-   community list and top "god nodes" (most-connected) from `graph.json`.
-   Prefer the Graphify MCP tools (`query_graph`, `get_neighbors`,
-   `shortest_path`) over parsing JSON by hand.
-2. **Stale** — regenerate if the `graphify` CLI or `/graphify` skill is
-   available, then treat as fresh. If not, use the stale graph and say so in
-   the report header; structure drifts slowly.
-3. **No graph, Graphify available** — run `/graphify .` once, then case 1.
-4. **No graph, no Graphify** — build a manual map. Listings and the two
-   commands below are free; spend at most ~15 file reads on top:
+1. **`graphify-out/graph.json` exists** — use it. Read `GRAPH_REPORT.md` first
+   (cheap summary), then pull the community list and top "god nodes"
+   (most-connected) from `graph.json`. Prefer the read-only Graphify MCP tools
+   (`query_graph`, `get_neighbors`, `shortest_path`) over parsing JSON by hand.
+
+   Report its age in the header, but use it either way — structure drifts
+   slowly, and a stale graph still beats no graph for prioritization. The graph
+   is **current** if no tracked file has changed since the commit that last
+   touched it:
+
+   ```bash
+   GRAPH_SHA=$(git log -1 --format=%H -- graphify-out/graph.json)
+   git diff --quiet "$GRAPH_SHA" HEAD -- . ':!audits' && echo current || echo stale
+   ```
+
+   Empty `GRAPH_SHA` means the graph is untracked — report "age unknown" and
+   skip the diff, do not run it with an empty argument. Never judge age by
+   mtime; a fresh clone stamps every file with clone time.
+2. **No graph** — build a manual map. Listings and the two commands below are
+   free; spend at most ~15 file reads on top:
    - Directory skeleton: `git ls-files` grouped by top-level dir.
    - Entry points: main/index files, route registrations, CLI entrypoints,
      exported package surface.
    - Churn hotspots (dropping paths that no longer exist):
 
      ```
-     git log --format= --name-only -n 300 | sort | uniq -c | sort -rn | awk '{print $2}' | while read f; do [ -f "$f" ] && echo "$f"; done | head -20
+     git log --format= --name-only -n 300 | sort | uniq -c | sort -rn | sed 's/^ *[0-9]* *//' | while read -r f; do [ -f "$f" ] && echo "$f"; done | head -20
      ```
 
    - Fan-in hotspots — which internal modules get imported most (adapt the
@@ -159,7 +169,7 @@ Findings from Phase 2 are hypotheses. Verification is the expensive phase, so
 narrow before spending it:
 
 1. **Dedup** — same file+line+claim from two finders is one finding.
-2. **Triage** — rank by severity and keep at most **12 candidates**. Everything
+2. **Triage** — rank by severity and keep at most **10 candidates**. Everything
    below the line is dropped: un-ranked, un-verified, never mentioned. This is
    how "prefer 8 confirmed over 40 plausible" actually gets enforced.
 3. **Verify every candidate** — spawn a skeptic per candidate (parallel where
@@ -169,7 +179,8 @@ narrow before spending it:
    Verdict: confirmed | refuted | plausible-unverified, one sentence why."
 
 **Hard cap: 15 skeptics** across candidates, critical second votes, and
-retries. If you would exceed it, cut the lowest-severity candidates.
+retries — 10 candidates leaves 5 spare votes. If you would still exceed it,
+cut the lowest-severity candidates.
 
 - Criticals get 2 independent skeptics; majority rules, with the original
   finder's claim as the third vote.
@@ -198,8 +209,8 @@ Create `audits/` if missing. `ls audits/` first: never overwrite a previous
 report — on collision (same-day rerun at the same sha) append `-2`, `-3`, … .
 Repo read-only → write to the working/scratch dir and say so.
 
-1. Header: repo, HEAD sha, date, map source (fresh graph / stale graph /
-   manual), coverage note — what was NOT examined (skipped dirs, generated
+1. Header: repo, HEAD sha, date, map source (graph — with its age: current /
+   stale / unknown — or manual), coverage note — what was NOT examined (skipped dirs, generated
    code, vendored deps, subsystems left out of the matrix), any finder that
    returned empty, and how many findings were triaged out unverified.
 2. Findings, severity-ranked, critical first. Each: the schema fields plus the
