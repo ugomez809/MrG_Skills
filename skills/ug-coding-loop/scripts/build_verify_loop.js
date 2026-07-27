@@ -53,23 +53,24 @@ const CONTEXT = A.context ?? ''
 const MODE = A.mode === 'plan-only' ? 'plan-only' : 'full'
 // Validate a caller-provided plan before trusting it: the plan-gate flow hands
 // the approved plan back (possibly hand-edited), so nothing guarantees shape.
-// Missing work_items would crash the run; items missing `id` silently poison
-// targeting (undefined === undefined matches every id-less item in planRework),
-// so ids are synthesized for any item that lacks one.
+// Missing work_items would crash the run. (Missing/duplicate item ids are fixed
+// centrally after the plan resolves — see the uniquify block below.)
 let PROVIDED_PLAN = null
 if (A.plan && typeof A.plan === 'object') {
   const p = A.plan
   if (Array.isArray(p.work_items) && p.work_items.length &&
       Array.isArray(p.acceptance_criteria) && p.acceptance_criteria.length) {
-    p.work_items.forEach((it, i) => { if (!it.id) it.id = `item-${i + 1}` })
     PROVIDED_PLAN = p
   }
 }
-const MAX_CYCLES = Math.max(1, Number.isFinite(A.maxCycles) ? A.maxCycles : 10)
+// Coerce numeric knobs: callers that stringify args deliver "5", which
+// Number.isFinite rejects — silently ignoring an explicit user setting.
+const _num = (v) => v == null ? NaN : Number(v)
+const MAX_CYCLES = Math.max(1, Number.isFinite(_num(A.maxCycles)) ? _num(A.maxCycles) : 10)
 // Stop early if we would dip below this many output tokens of headroom (only
 // active when the turn set a budget target). Prevents a half-finished loop from
 // starving the rest of the turn.
-const BUDGET_FLOOR = Number.isFinite(A.minBudgetFloor) ? A.minBudgetFloor : 40000
+const BUDGET_FLOOR = Number.isFinite(_num(A.minBudgetFloor)) ? _num(A.minBudgetFloor) : 40000
 
 const j = (x) => JSON.stringify(x, null, 2)
 
@@ -83,9 +84,25 @@ const SPENT0 = budget.spent()
 const spentSoFar = () => Math.max(0, budget.spent() - SPENT0)
 const fmtK = (n) => n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
 
-const collectIssues = (verdicts) =>
-  verdicts.filter(Boolean).flatMap(v => (v.blocking_issues || []).map(i =>
+// Normalized prose for fingerprinting/dedupe: lowercase, punctuation squashed.
+const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 40)
+
+// Collect blocking issues across verdicts, deduping cross-lane duplicates: two
+// parallel reviewers reporting the same defect (same implicated file + same
+// acceptance criterion, prose reworded) collapse to one issue, so rework
+// prompts don't bloat and the stall tracker isn't skewed by lane count.
+const collectIssues = (verdicts) => {
+  const seen = new Set()
+  return verdicts.filter(Boolean).flatMap(v => (v.blocking_issues || []).map(i =>
     typeof i === 'string' ? { problem: i } : i))
+    .filter(i => {
+      const key = (issueFile(i) || norm(i.where)) + '|' + norm(i.criterion)
+      if (key === '|') return true            // nothing stable to dedupe on
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
 
 // --- Targeted re-run: attribute each rework issue to the work item that owns
 // the file it names, so a cycle re-runs only the implicated coders and carries
@@ -106,13 +123,15 @@ const issueFile = (iss) => {
 // Path-looking tokens out of raw command output (stack traces, compiler errors,
 // test headers). Deterministic backstop for the smoke gate: it does not depend on
 // the smoke agent choosing to fill implicated_files. Strips :line[:col], dedupes.
-const SMOKE_PATH_RE = /[A-Za-z0-9_@./-]+\.[A-Za-z]{1,4}(?::\d+)?/g
+const SMOKE_PATH_RE = /[\p{L}\p{N}_@./-]+\.[A-Za-z]{1,4}(?::\d+)?/gu
 const extractPaths = (text) => [...new Set((String(text || '').match(SMOKE_PATH_RE) || [])
   .map(t => t.split(':')[0].replace(/^\.\//, ''))
   .filter(Boolean))]
-// Disjoint ownership => a file maps to at most one item. Suffix-match on a '/'
-// boundary so "app.py" resolves against an owned "src/app.py" (and vice versa)
-// but never against "webapp.py".
+// Disjoint ownership => a FULL path maps to at most one item. A bare name
+// ("test.py") can suffix-match several items owning same-named files in
+// different dirs — all matches re-run, which is safe (mild waste, never a
+// skipped fix). Suffix-match on a '/' boundary so "app.py" resolves against an
+// owned "src/app.py" (and vice versa) but never against "webapp.py".
 const ownersOf = (file, items) => !file ? [] :
   items.filter(it => itemFiles(it).some(of =>
     of === file || of.endsWith('/' + file) || file.endsWith('/' + of)))
@@ -322,6 +341,19 @@ if (!PLAN) {
 } else {
   log('Approved plan provided. Skip Fable plan phase — no top-model tokens spent.')
 }
+// Uniquify item ids (missing OR duplicated — the schema requires id but not
+// uniqueness, and a synthesized id could collide with a hand-written one).
+// Duplicates would collapse buildsById entries, silently dropping a coder's
+// report from what the reviewers see, and cross-wire issue targeting.
+{
+  const seen = new Set()
+  PLAN.work_items.forEach((it, i) => {
+    let id = String(it.id || '') || `item-${i + 1}`
+    while (seen.has(id)) id = `${id}-dup`
+    seen.add(id)
+    it.id = id
+  })
+}
 log(`Plan ready. ${PLAN.work_items.length} work item(s), ${PLAN.acceptance_criteria.length} criteria. [${fmtK(spentSoFar())} tok]`)
 
 if (MODE === 'plan-only') {
@@ -338,37 +370,53 @@ let cycle = 0
 // Latest build result per work item, persisted across cycles so a targeted
 // rework carries untouched items forward instead of rebuilding them.
 const buildsById = new Map()
+// Items that already completed the CURRENT round's build. Non-empty only after
+// a dead-coder retry cycle: the next cycle rebuilds just the missing items
+// instead of re-spawning every coder over work already in the workspace.
+const doneThisRound = new Set()
 // Smoke-attribution state machine: 'fresh' (may target), 'targeted' (last red
 // was handled by targeted attribution — another red means the attribution was
 // wrong, escalate), 'escalated' (STAY on full re-runs; no targeted/full
 // ping-pong). Only a smoke pass resets to 'fresh'.
 let smokeMode = 'fresh'
+// Consecutive red smoke checks. Three in a row (one targeted attempt + two
+// full re-runs) means the command itself may be unfixable by any coder (bad
+// cwd, missing dep nobody owns) — stop as 'stalled' instead of burning the
+// remaining cycles on full-team rebuilds. Reset on green; a dead smoke agent
+// changes nothing (no new information).
+let smokeReds = 0
 // Green smoke evidence from THIS cycle, handed to the reviewers so they don't
 // burn tokens re-running a command a cheaper agent already proved exits 0.
 let smokeEvidence = null
-// Verify/bless stall detection: the same issue list two cycles running means
-// targeted rework isn't converging — escalate to one full re-run (every coder,
-// every issue); if the identical list comes back a third time, stop as
-// 'stalled' instead of burning cycles on a loop that can't converge.
+// Verify/bless stall detection. "Stall" = consecutive rejections implicate the
+// same PLACES with no drop in issue count: one repeat escalates to a full
+// re-run (every coder, every issue); a second repeat after that stops as
+// 'stalled'. A shrinking issue count is progress and resets the counter, so a
+// single-work-item task grinding 5 -> 2 -> 1 issues in the same file is never
+// mistaken for a stall. The tracker resets whenever a gate PASSES — otherwise
+// bless's first-ever rejection could inherit verify's repeat count and be
+// swallowed as a stall without any coder ever seeing it (a skipped fix).
 let lastSig = null
+let lastCount = Infinity
 let sigRepeats = 0
 let forceFullRework = false
-// Fingerprint on the STABLE parts of an issue list: the set of implicated
-// files plus the issue count. Fresh reviewer agents reword problem text every
-// cycle, so verbatim prose never matches; files and counts repeat reliably.
-// Tradeoff: two DIFFERENT issues in the same files across cycles read as
-// "same" — that only widens the re-run once and, at three strikes, stops
-// honestly with the issues listed, both acceptable.
-const issueSig = (list) => JSON.stringify([list.length,
-  ...[...new Set(list.map(i => issueFile(i) || String(i.where || '').slice(0, 40)))].sort()])
-// Returns true when the loop should stop (three identical lists).
+const resetStall = () => { lastSig = null; lastCount = Infinity; sigRepeats = 0; forceFullRework = false }
+// Fingerprint on the STABLE parts of an issue: the implicated file, else the
+// acceptance criterion (a fixed list, so its prose is stable across cycles),
+// else normalized `where`. Fresh reviewer agents reword free prose every
+// cycle, so raw problem text never matches.
+const issueSig = (list) => JSON.stringify([...new Set(list.map(i =>
+  issueFile(i) || norm(i.criterion) || norm(i.where)))].sort())
+// Returns true when the loop should stop.
 const trackStall = (list, cycle) => {
   const sig = issueSig(list)
-  if (sig === lastSig) sigRepeats++
-  else { sigRepeats = 0; lastSig = sig }
+  if (sig === lastSig && list.length >= lastCount) sigRepeats++
+  else sigRepeats = 0
+  lastSig = sig
+  lastCount = list.length
   if (sigRepeats >= 2) return true
   forceFullRework = sigRepeats === 1
-  if (forceFullRework) log(`cycle ${cycle}: identical issues as last cycle — escalating to full re-run, all issues to all coders.`)
+  if (forceFullRework) log(`cycle ${cycle}: same places failing with no progress — escalating to full re-run, all issues to all coders.`)
   return false
 }
 
@@ -381,15 +429,18 @@ while (cycle < MAX_CYCLES) {
   // just its own issues, and carry every other item's prior build forward.
   phase('Build')
   const items = PLAN.work_items
-  const jobs = planRework(items, fixList, forceFullRework)
-  // What this cycle reworked, handed to the reviewers so they verify the fixes
-  // specifically instead of cold-reviewing everything from scratch. Output blobs
-  // stripped — reviewers gather their own evidence.
+  let jobs = planRework(items, fixList, forceFullRework)
+  // Resuming after a dead-coder cycle: only the items that didn't finish that
+  // round rebuild; the ones that did keep their fresh builds.
+  if (doneThisRound.size) jobs = jobs.filter(jb => !doneThisRound.has(jb.item.id))
+  // What this round reworked (both halves, when split by a retry), handed to
+  // the reviewers so they verify the fixes specifically instead of
+  // cold-reviewing everything from scratch. Output blobs stripped — reviewers
+  // gather their own evidence.
   const reworkNote = fixList ? {
-    rebuilt: jobs.map(jb => jb.item.id || jb.item.title),
+    rebuilt: [...new Set([...doneThisRound, ...jobs.map(jb => jb.item.id)])],
     issues: fixList.map(({ output, ...rest }) => rest),
   } : null
-  forceFullRework = false
   if (fixList) log(`cycle ${cycle}: rework ${jobs.length}/${items.length} item(s); ${items.length - jobs.length} carried forward. [${fmtK(spentSoFar())} tok]`)
   const ran = await parallel(jobs.map(({ item, issues }, i) => () =>
     agent(buildPrompt(item, issues), { label: `build:${item.id || i}`, phase: 'Build', model: MODELS.coder, schema: BUILD_SCHEMA })))
@@ -421,13 +472,18 @@ while (cycle < MAX_CYCLES) {
   lastBuilds = [...buildsById.values()]
   log(`cycle ${cycle}: ${ran.filter(Boolean).length}/${jobs.length} coder(s) done, ${lastBuilds.length}/${items.length} item(s) built. [${fmtK(spentSoFar())} tok]`)
   // A coder still dead after its retry means this build is knowingly incomplete —
-  // grading it wastes smoke/review spend. Re-run the cycle: fixList is unchanged,
-  // so the same jobs re-run; MAX_CYCLES bounds the retries.
+  // grading it wastes smoke/review spend. Re-run the cycle: fixList and
+  // forceFullRework are left untouched so the next cycle re-plans the same
+  // round, and doneThisRound narrows it to just the missing items; MAX_CYCLES
+  // bounds the retries.
   if (ran.some(b => !b)) {
+    ran.forEach((b, k) => { if (b) doneThisRound.add(jobs[k].item.id) })
     history.push({ cycle, gate: 'build', pass: false })
-    log(`cycle ${cycle}: ${ran.filter(b => !b).length} coder(s) unresponsive after retry — skip grading, retry cycle. [${fmtK(spentSoFar())} tok]`)
+    log(`cycle ${cycle}: ${ran.filter(b => !b).length} coder(s) unresponsive after retry — skip grading, retrying just those. [${fmtK(spentSoFar())} tok]`)
     continue
   }
+  doneThisRound.clear()
+  forceFullRework = false
 
   // SMOKE — optional Haiku tripwire between Build and Verify. If the plan
   // defined an objective check and it fails, both Opus reviewers are skipped
@@ -475,11 +531,18 @@ while (cycle < MAX_CYCLES) {
         output: evidence,
       }]
       smokeMode = smokeMode !== 'fresh' ? 'escalated' : (owned.length ? 'targeted' : 'fresh')
+      smokeReds++
       history.push({ cycle, gate: 'smoke', pass: false, targeted: owned })
+      if (smokeReds >= 3) {
+        status = 'stalled'
+        log(`cycle ${cycle}: smoke red ${smokeReds} cycles running — the check may be unfixable by the coders, stopping. [${fmtK(spentSoFar())} tok]`)
+        break
+      }
       log(`cycle ${cycle}: smoke RED${owned.length ? ` — implicates ${owned.join(', ')}` : ' — no targeted attribution, full re-run'}. Skip Opus, back to Sonnet. [${fmtK(spentSoFar())} tok]`)
       continue
     } else {
       smokeMode = 'fresh'
+      smokeReds = 0
       smokeEvidence = (smoke.evidence || '').slice(0, 2000)
       history.push({ cycle, gate: 'smoke', pass: true })
       log(`cycle ${cycle}: smoke green. [${fmtK(spentSoFar())} tok]`)
@@ -530,6 +593,12 @@ while (cycle < MAX_CYCLES) {
     continue
   }
   history.push({ cycle, gate: 'verify', pass: true })
+  // Gate passed: the old fix list is confirmed resolved — clear it so a later
+  // green-unblessed stop doesn't report fixed issues as outstanding, and reset
+  // the stall tracker so a first bless rejection starts from a clean slate
+  // instead of inheriting verify's repeat count.
+  fixList = null
+  resetStall()
 
   // BLESS — single Fable review. Only reached when both reviewers already agree.
   if (belowBudget()) { status = 'green-unblessed'; log(`cycle ${cycle}: Opus green but token floor hit. Skip Fable bless.`); break }

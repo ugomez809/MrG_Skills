@@ -17,7 +17,8 @@ description: >-
 compatibility: >-
   Needs the Workflow tool (deterministic multi-agent orchestration) with
   per-agent model routing. Falls back to the Agent tool if Workflow is
-  unavailable. Model aliases fable/opus/sonnet must resolve in the environment.
+  unavailable. Model aliases fable/opus/sonnet/haiku must resolve in the
+  environment (haiku powers the smoke gate).
 ---
 
 # Model Ladder Loop
@@ -69,8 +70,10 @@ Report: status, cycles used, what shipped, any outstanding issues
 
 **Targeted rework — only the implicated coders re-run.** A rework cycle does not
 re-spawn every coder. Each reviewer issue names a file; the loop maps that file
-to the work item that owns it (work items own disjoint files, so the mapping is
-1:1) and re-runs only those coders, each handed just its own issues. Every
+to the work item that owns it (work items own disjoint files, so a full path
+maps to one item; an ambiguous bare name may match several, all of which
+re-run — safe, mildly wasteful) and re-runs only those coders, each handed just
+its own issues. Every
 untouched item carries its previous build forward — reviewers still grade the
 merged whole.
 
@@ -90,7 +93,10 @@ Two escape hatches keep the "never skip a needed fix" guarantee:
 - **The same smoke check fails twice in a row** → the file showing the symptom
   wasn't the file causing it, so the second failure escalates to a full re-run
   regardless of what the output names — and *stays* escalated (no targeted/full
-  ping-pong) until a smoke pass resets the tracker.
+  ping-pong) until a smoke pass resets the tracker. A **third** consecutive red
+  stops the run as `stalled`: the command itself may be unfixable by any coder
+  (a typo'd working directory, a missing dependency nobody owns), and burning
+  the remaining cycles on full-team rebuilds won't change that.
 
 This is the disjoint-files invariant paying off twice: it makes parallel building
 safe AND makes targeted rework safe, and it's the biggest per-cycle token saver
@@ -126,11 +132,13 @@ More design choices worth understanding, because they are what make this cheap:
    reviewers receive the rejected issues and which items were rebuilt, so they
    verify the fixes specifically instead of cold-reviewing from scratch. And the
    loop watches for non-convergence: when consecutive rejections implicate the
-   same files with the same issue count (issue *prose* varies between fresh
-   reviewer agents, so files+count is the stable fingerprint), it escalates
-   once to a full re-run (every issue to every coder); a third repeat stops the
-   run as `stalled` — cycles are only spent while they're actually buying
-   progress toward green. Ownership also *grows* as coders work: files a coder
+   same places with *no drop in issue count* (issue prose varies between fresh
+   reviewer agents, so the stable fingerprint is the implicated files — or the
+   acceptance criterion for pathless issues — plus whether the count shrank),
+   it escalates once to a full re-run (every issue to every coder); a repeat
+   after that stops the run as `stalled`. A shrinking issue count always
+   counts as progress and resets the tracker, and so does any gate passing —
+   cycles are only spent while they're actually buying progress toward green. Ownership also *grows* as coders work: files a coder
    creates (its tests, helpers) are folded into its item, so later issues
    naming them stay attributable, and a coder touching another item's file
    logs a disjointness warning.
@@ -433,11 +441,12 @@ Knobs the user is likely to ask about:
 - **Fewer/more cycles:** `maxCycles` (default 10). Lower it to cap cost harder,
   raise it (or set it very high) to let the loop genuinely run until green —
   that's safe because two other brakes exist: the budget floor, and the stall
-  guard. When consecutive rejections implicate the same files with the same
+  guard. When consecutive rejections implicate the same places with no drop in
   issue count, the loop escalates once to a full re-run with every issue
-  handed to every coder; a third repeat stops as `stalled` instead of burning
-  cycles it cannot convert. So cycles are only spent while the loop is
-  actually converging.
+  handed to every coder; a repeat after that stops as `stalled` instead of
+  burning cycles it cannot convert (three consecutive red smoke checks stop
+  the same way). So cycles are only spent while the loop is actually
+  converging.
 - **Harder cost ceiling:** `minBudgetFloor` plus a turn budget target. The loop
   checks remaining headroom before each cycle and before spending Fable, and
   stops cleanly instead of starving the rest of the turn.
@@ -482,7 +491,7 @@ Agent tool, preserving the ladder and the no-Fable-in-retries rule:
 4. On any Opus fail, loop back to step 2 with the collected issues — do **not**
    call Fable. Only when both Opus pass, one `Agent` with `model: "fable"` for
    the final review.
-5. Cap at 6 cycles; report status, cycles, and outstanding issues.
+5. Cap at 10 cycles; report status, cycles, and outstanding issues.
 
 The hand-run version is less reliable at faithfully looping — prefer the script
 whenever Workflow exists.
