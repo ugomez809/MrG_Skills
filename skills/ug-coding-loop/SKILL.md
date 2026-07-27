@@ -72,12 +72,27 @@ re-spawn every coder. Each reviewer issue names a file; the loop maps that file
 to the work item that owns it (work items own disjoint files, so the mapping is
 1:1) and re-runs only those coders, each handed just its own issues. Every
 untouched item carries its previous build forward — reviewers still grade the
-merged whole. When an issue can't be pinned to a file — a smoke-gate failure (a
-red test command names no item), a component-name issue, or a plan whose items
-declared no files — the loop conservatively re-runs all coders, so a needed fix
-is never skipped. This is the disjoint-files invariant paying off twice: it makes
-parallel building safe AND makes targeted rework safe, and it's the biggest
-per-cycle token saver after the first build.
+merged whole.
+
+Smoke failures attribute the same way. A red command prints file paths — stack
+frames, compiler errors, failing-test headers — so the loop collects them from
+two independent sources (the paths Haiku reports in `implicated_files`, plus a
+regex sweep of the raw output as a deterministic backstop), keeps the ones that
+map to a work item, and files one issue per file. Only the owning coders re-run.
+
+Two escape hatches keep the "never skip a needed fix" guarantee:
+
+- **No path maps to a work item** (a segfault with no trace, a failure naming
+  only vendored files, a plan whose items declared no files, or a reviewer issue
+  that names a component instead of a file) → the loop files one nameless issue
+  and re-runs all coders.
+- **The same smoke check fails twice in a row** → the file showing the symptom
+  wasn't the file causing it, so the second failure escalates to a full re-run
+  regardless of what the output names. The tracker resets whenever smoke passes.
+
+This is the disjoint-files invariant paying off twice: it makes parallel building
+safe AND makes targeted rework safe, and it's the biggest per-cycle token saver
+after the first build.
 
 Two more design choices worth understanding, because they are what make this cheap:
 

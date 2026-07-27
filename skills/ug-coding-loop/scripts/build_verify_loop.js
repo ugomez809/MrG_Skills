@@ -84,6 +84,13 @@ const issueFile = (iss) => {
   const path = tok.split(':')[0]       // drop :line[:col]
   return /[./]/.test(path) ? path.replace(/^\.\//, '') : ''
 }
+// Path-looking tokens out of raw command output (stack traces, compiler errors,
+// test headers). Deterministic backstop for the smoke gate: it does not depend on
+// the smoke agent choosing to fill implicated_files. Strips :line[:col], dedupes.
+const SMOKE_PATH_RE = /[A-Za-z0-9_@./-]+\.[A-Za-z]{1,4}(?::\d+)?/g
+const extractPaths = (text) => [...new Set((String(text || '').match(SMOKE_PATH_RE) || [])
+  .map(t => t.split(':')[0].replace(/^\.\//, ''))
+  .filter(Boolean))]
 // Disjoint ownership => a file maps to at most one item. Suffix-match so
 // "src/app.py:142" resolves against an owned "src/app.py" regardless of prefix.
 const ownersOf = (file, items) => !file ? [] :
@@ -143,6 +150,10 @@ const SMOKE_SCHEMA = {
   properties: {
     green: { type: 'boolean', description: 'true ONLY if the command exited with status 0.' },
     evidence: { type: 'string', description: 'The command run, its exit code, and the tail (~50 lines) of its raw output.' },
+    implicated_files: {
+      type: 'array', items: { type: 'string' },
+      description: 'Every file path that appears in the failure output, repo-relative when possible. Empty list if none appear.',
+    },
   },
 }
 const VERDICT_SCHEMA = {
@@ -218,7 +229,9 @@ ${PLAN.smoke_command}
 TASK (context only, for orientation — you are not implementing it):
 ${TASK}
 
-Report green=true ONLY if the command exited with status 0 (append '; echo EXIT:$?' if needed to capture it). Include the exit code and the tail of the raw output as evidence — the raw output is what the coders will act on if red, so do not summarize it away.`
+Report green=true ONLY if the command exited with status 0 (append '; echo EXIT:$?' if needed to capture it). Include the exit code and the tail of the raw output as evidence — the raw output is what the coders will act on if red, so do not summarize it away.
+
+Also fill implicated_files: list every file path that appears in the failure output (repo-relative when possible); empty list if none appear. Copy them from the output, do not infer paths that are not printed there.`
 
 const verifyPrompt = (builds, lane) => `You are independent reviewer ${lane}. You are one of two reviewers grading this work SEPARATELY — you cannot see the other reviewer, and you should assume they may miss things, so do your own thorough pass. Be skeptical: your job is to catch problems before an expensive top-tier review is spent.
 
@@ -279,6 +292,10 @@ let cycle = 0
 // Latest build result per work item, persisted across cycles so a targeted
 // rework carries untouched items forward instead of rebuilding them.
 const buildsById = new Map()
+// True when the previous cycle's smoke failure was handled by targeted
+// attribution. Escalation guard: a second consecutive red smoke means the
+// attribution was wrong, so the next one re-runs everything. Reset on green.
+let smokeWasTargeted = false
 
 while (cycle < MAX_CYCLES) {
   if (belowBudget()) { status = 'budget-stopped'; log(`Stop. Token floor hit before cycle ${cycle + 1}.`); break }
@@ -308,16 +325,35 @@ while (cycle < MAX_CYCLES) {
     phase('Smoke')
     const smoke = await agent(smokePrompt(), { label: 'smoke:haiku', phase: 'Smoke', model: MODELS.smoke, schema: SMOKE_SCHEMA })
     if (smoke && !smoke.green) {
-      fixList = [{
+      // TARGETED_SMOKE_REWORK_V2 — a red smoke check names files in its output;
+      // map those to the work items that own them and re-run only those coders,
+      // instead of re-running every coder over a nameless issue. Two sources are
+      // unioned: what the smoke agent reported, and a regex sweep of the raw
+      // evidence (the deterministic backstop, independent of the agent). If no
+      // named path maps to an item — or if the previous cycle already tried
+      // targeted attribution and smoke failed again, meaning the file showing the
+      // symptom was not the file causing it — fall back to the nameless issue,
+      // which planRework() turns into a full re-run.
+      const evidence = (smoke.evidence || '').slice(0, 4000)
+      const named = [...new Set([...(smoke.implicated_files || []).map(f => String(f).replace(/^\.\//, '')), ...extractPaths(smoke.evidence)])]
+      const owned = smokeWasTargeted ? [] : named.filter(p => ownersOf(p, PLAN.work_items).length > 0)
+      fixList = owned.length ? owned.map(f => ({
+        problem: `Objective check failed: ${PLAN.smoke_command} — failure implicates this file`,
+        where: f,
+        fix: 'Make this command pass. Its raw failing output follows — work from it.',
+        output: evidence,
+      })) : [{
         problem: `Objective check failed: ${PLAN.smoke_command}`,
         where: 'smoke gate (pre-review)',
         fix: 'Make this command pass. Its raw failing output follows — work from it.',
-        output: (smoke.evidence || '').slice(0, 4000),
+        output: evidence,
       }]
-      history.push({ cycle, gate: 'smoke', pass: false })
-      log(`cycle ${cycle}: smoke RED. Skip Opus, back to Sonnet. [${fmtK(spentSoFar())} tok]`)
+      smokeWasTargeted = owned.length > 0
+      history.push({ cycle, gate: 'smoke', pass: false, targeted: owned })
+      log(`cycle ${cycle}: smoke RED${owned.length ? ` — implicates ${owned.join(', ')}` : ' — no owned file named, full re-run'}. Skip Opus, back to Sonnet. [${fmtK(spentSoFar())} tok]`)
       continue
     }
+    smokeWasTargeted = false
     history.push({ cycle, gate: 'smoke', pass: true })
     log(`cycle ${cycle}: smoke green. [${fmtK(spentSoFar())} tok]`)
   }
